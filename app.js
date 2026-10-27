@@ -407,7 +407,7 @@ const files = new Map();
 function startWorker() {
   if (worker) worker.terminate();
   files.clear();
-  worker = new Worker('worker.js', { type: 'module' });
+  worker = new Worker('worker.js?v=2', { type: 'module' });
   worker.onmessage = onWorker;
   worker.onerror = (e) => {
     console.error(e);
