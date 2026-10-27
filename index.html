@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notas da Consulta</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page">
+  <header class="top">
+    <div class="brand">
+      <div class="logo">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"></rect><path d="M5 10a7 7 0 0 0 14 0"></path><path d="M12 17v4"></path></svg>
+      </div>
+      <div class="brand-text">
+        <span class="brand-name">Notas da Consulta</span>
+        <span class="muted small">Transcrição de reuniões presenciais</span>
+      </div>
+    </div>
+    <div class="status-pill" role="status" aria-live="polite">
+      <span class="dot" id="recDot" hidden aria-hidden="true"></span>
+      <span id="statusLabel" class="status-label">Pronto</span>
+      <span id="clock" class="clock">00:00</span>
+    </div>
+  </header>
+
+  <section class="card controls">
+    <div class="meeting">
+      <label for="mtitle" class="eyebrow">Reunião</label>
+      <input id="mtitle" class="title-input" value="Consulta com cliente" autocomplete="off">
+      <span class="muted small" id="meta"></span>
+    </div>
+    <div class="buttons">
+      <button id="btnStart" class="btn btn-primary btn-lg" disabled>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"></rect><path d="M5 10a7 7 0 0 0 14 0"></path><path d="M12 17v4"></path></svg>
+        <span>Começar a ouvir</span></button>
+      <button id="btnPause" class="btn" hidden>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M8 5v14M16 5v14"></path></svg>
+        Pausar</button>
+      <button id="btnMark" class="btn" hidden>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 21V4h11l-2 4 2 4H5"></path></svg>
+        Marcar momento</button>
+      <button id="btnResume" class="btn btn-primary" hidden>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4.5v15l12-7.5z"></path></svg>
+        Retomar</button>
+      <button id="btnStop" class="btn btn-dark" hidden>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"></rect></svg>
+        Encerrar</button>
+      <button id="btnNew" class="btn" hidden>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>
+        Nova reunião</button>
+      <span class="divider" aria-hidden="true"></span>
+      <button id="btnCopy" class="btn btn-icon" disabled aria-label="Copiar transcrição" title="Copiar transcrição">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"></rect><path d="M5 15V5a2 2 0 0 1 2-2h8"></path></svg>
+      </button>
+      <button id="btnDownload" class="btn" disabled aria-label="Baixar .txt" title="Baixar transcrição em .txt">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5M4 20h16"></path></svg>
+        .txt</button>
+    </div>
+  </section>
+
+  <div class="columns">
+    <section aria-label="Transcrição" class="card transcript">
+      <div class="card-head">
+        <h2>Transcrição</h2>
+        <span class="muted small" id="counts">0 falas · 0 marcadas</span>
+      </div>
+      <div id="list" class="list">
+        <div id="empty" class="empty">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#8A8F99" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"></rect><path d="M5 10a7 7 0 0 0 14 0"></path><path d="M12 17v4"></path></svg>
+          <p class="empty-title">Pronto para quando a reunião começar</p>
+          <p class="empty-text">Coloque o aparelho sobre a mesa e toque em Começar a ouvir. A conversa aparece aqui conforme as pessoas falam.</p>
+        </div>
+        <div id="lines"></div>
+        <div id="listening" class="listening" hidden>
+          <span class="eq" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+          <span id="listeningText">Ouvindo…</span>
+        </div>
+        <div id="pausedNote" class="listening" hidden>Pausado. Nada está sendo captado.</div>
+      </div>
+    </section>
+
+    <aside aria-label="Anotações" class="side">
+      <section class="card side-card">
+        <h2>Resumo com o Claude</h2>
+        <p class="muted small-14">Ao final da reunião, copie a transcrição já com as instruções e cole no Claude. Ele devolve o resumo, os pontos principais e os próximos passos.</p>
+        <button id="btnClaude" class="btn btn-claude" disabled>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"></rect><path d="M5 15V5a2 2 0 0 1 2-2h8"></path></svg>
+          Copiar para o Claude</button>
+        <a id="openClaude" class="small-14" href="https://claude.ai/new" target="_blank" rel="noopener">Abrir o Claude ↗</a>
+      </section>
+
+      <section class="card side-card">
+        <h2>Falantes</h2>
+        <p id="noSpeakers" class="muted small-14">As vozes diferentes aparecem aqui como Falante 1, 2, 3. Clique no nome para trocar.</p>
+        <ul id="speakers" class="speakers"></ul>
+      </section>
+
+      <section class="card side-card">
+        <h2>Reconhecimento de voz</h2>
+        <p id="engineText" class="muted small-14">Preparando…</p>
+        <div id="progressWrap" class="progress" hidden><div id="progressBar"></div></div>
+        <label class="small-14 quality">
+          Qualidade
+          <select id="quality">
+            <option value="auto">Automática</option>
+            <option value="alta">Alta (mais precisa, download maior)</option>
+            <option value="leve">Leve (mais rápida)</option>
+          </select>
+        </label>
+      </section>
+
+      <p class="muted small footnote">O áudio é processado só neste computador e não é gravado. Nomes e anotações são um rascunho. Revise antes de compartilhar com o cliente.</p>
+    </aside>
+  </div>
+</div>
+<div id="toast" class="toast" role="status" hidden></div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
