@@ -8,16 +8,11 @@ const FRAME = 512;
 const STORE_KEY = 'notas-consulta:v1';
 const QUALITY_KEY = 'notas-consulta:quality';
 
-// Voice-print similarity (cosine). Synthetic test voices: same speaker 0.58-0.95
-// (clean and with room noise), different <0.15. Real people vary more (tone,
-// posture, distance), so a new speaker is only created when a clip is clearly
-// unlike everyone so far; anything in between goes to the closest known voice.
-const NEW_SPEAKER = 0.25;
-// After the meeting, groups whose voices are at least this close are merged.
-const MERGE_SPEAKERS = 0.35;
-// Clips shorter than this ("sim", "uhum") give unreliable voice prints and
-// never start a new speaker.
-const MIN_NEW_SPEAKER_SECONDS = 2;
+// Voice prints (cosine) of two groups of sentences at least this alike are the
+// same person. Real Portuguese speakers through a 48 kHz mic path: 0.15-0.20
+// separated 2, 3 and 4 speakers with no errors; 0.25+ starts splitting people,
+// 0.10 merges them. See README "Tested".
+const SAME_SPEAKER = 0.18;
 const SPEAKER_COLORS = ['#1F3A5F', '#0F6B5C', '#8A4B00', '#6B3FA0', '#A0325A', '#3F6B1F', '#5B616E'];
 
 const CLAUDE_PROMPT = `Você é assistente de uma advogada brasileira. Abaixo está a transcrição automática de uma reunião presencial com cliente(s).
@@ -64,7 +59,6 @@ const S = {
   people: 0, // expected number of people in the room; 0 = detect automatically
 };
 const pending = new Map(); // segment id -> { t, marked }
-let centroids = []; // index = speaker - 1; { sum: Float64Array, n }
 
 // ---------- dom ----------
 const $ = (id) => document.getElementById(id);
@@ -98,6 +92,11 @@ function normalize(v) {
   s = Math.sqrt(s) || 1;
   return v.map((x) => x / s);
 }
+function dot(a, b) {
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d += a[i] * b[i];
+  return d;
+}
 function cosine(a, b) {
   let d = 0, na = 0, nb = 0;
   for (let i = 0; i < a.length; i++) { d += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
@@ -121,96 +120,110 @@ function cleanText(t) {
 }
 
 // ---------- speakers ----------
-// How well a voice print matches each known speaker: the better of the
-// speaker's average voice and their single closest earlier clip, so one person
-// whose tone varies over the meeting still matches.
-function speakerScores(v) {
-  return centroids.map((c, i) => {
-    if (!c.sum || !c.n) return { spk: i + 1, sim: -1 };
-    let sim = cosine(v, c.sum);
-    for (const l of S.lines) if (l.spk === i + 1 && l.emb) sim = Math.max(sim, cosine(v, l.emb));
-    return { spk: i + 1, sim };
-  });
-}
+// Who said what is decided by grouping every voice print heard so far
+// (average-linkage agglomerative clustering), re-run as each sentence arrives.
+// Deciding one sentence at a time failed on real voices: short clips give noisy
+// prints (same person 0.12-0.9, different people up to 0.23), so early guesses
+// locked people into the wrong speaker. User fixes are respected:
+// - a single line moved by hand ("manual") is left out and keeps its speaker;
+// - speakers joined with "Juntar com…" ("anchor") start as one group that
+//   new sentences can still join, and never merges with another anchor.
+function clusterSpeakers() {
+  const items = S.lines.filter((l) => l.emb && !l.manual);
+  if (!items.length) return false;
+  const vecs = items.map((l) => normalize(l.emb));
 
-function assignSpeaker(emb, dur) {
-  const last = S.lines.length ? S.lines[S.lines.length - 1].spk : 0;
-  if (!emb) return last || addCentroid(null);
-  const v = normalize(emb);
-  const best = speakerScores(v).reduce((a, b) => (b.sim > a.sim ? b : a), { spk: 0, sim: -1 });
-  const full = S.people > 0 && centroids.length >= S.people;
-  if (best.spk && (best.sim >= NEW_SPEAKER || dur < MIN_NEW_SPEAKER_SECONDS || full)) {
-    const c = centroids[best.spk - 1];
-    for (let i = 0; i < v.length; i++) c.sum[i] += v[i];
-    c.n++;
-    return best.spk;
+  // Start with one group per joined speaker plus one per other sentence.
+  const groups = [];
+  const pinned = new Map();
+  items.forEach((l, i) => {
+    if (l.anchor) {
+      if (!pinned.has(l.anchor)) { pinned.set(l.anchor, groups.length); groups.push({ m: [], pin: l.anchor }); }
+      groups[pinned.get(l.anchor)].m.push(i);
+    } else groups.push({ m: [i], pin: 0 });
+  });
+
+  // Pairwise group similarity (average of member similarities).
+  const n = groups.length;
+  const sim = Array.from({ length: n }, () => new Float64Array(n));
+  for (let a = 0; a < n; a++) {
+    for (let b = a + 1; b < n; b++) {
+      let s = 0;
+      for (const i of groups[a].m) for (const j of groups[b].m) s += dot(vecs[i], vecs[j]);
+      sim[a][b] = sim[b][a] = s / (groups[a].m.length * groups[b].m.length);
+    }
   }
-  return addCentroid(v);
-}
-function addCentroid(v) {
-  centroids.push({ sum: v ? Float64Array.from(v) : null, n: v ? 1 : 0 });
-  return centroids.length;
-}
-function rebuildCentroids() {
-  const max = S.lines.reduce((m, l) => Math.max(m, l.spk), 0);
-  centroids = Array.from({ length: max }, () => ({ sum: null, n: 0 }));
-  for (const l of S.lines) {
-    if (!l.emb) continue;
-    const c = centroids[l.spk - 1];
-    const v = normalize(l.emb);
-    if (!c.sum) c.sum = new Float64Array(v.length);
-    for (let i = 0; i < v.length; i++) c.sum[i] += v[i];
-    c.n++;
+  const alive = new Set(groups.keys());
+  const canMerge = (a, b) => !(groups[a].pin && groups[b].pin && groups[a].pin !== groups[b].pin);
+  const best = new Int32Array(n).fill(-1);
+  const findBest = (a) => {
+    best[a] = -1;
+    for (const b of alive) if (b !== a && canMerge(a, b) && (best[a] < 0 || sim[a][b] > sim[a][best[a]])) best[a] = b;
+  };
+  for (const a of alive) findBest(a);
+
+  for (;;) {
+    let a = -1;
+    for (const x of alive) if (best[x] >= 0 && (a < 0 || sim[x][best[x]] > sim[a][best[a]])) a = x;
+    if (a < 0) break;
+    const b = best[a];
+    const tooMany = S.people > 0 && alive.size > S.people;
+    if (sim[a][b] < SAME_SPEAKER && !tooMany) break;
+    // Merge b into a; average linkage update.
+    const na = groups[a].m.length, nb = groups[b].m.length;
+    for (const k of alive) {
+      if (k === a || k === b) continue;
+      sim[a][k] = sim[k][a] = (na * sim[a][k] + nb * sim[b][k]) / (na + nb);
+    }
+    groups[a].m.push(...groups[b].m);
+    groups[a].pin = groups[a].pin || groups[b].pin;
+    alive.delete(b);
+    for (const k of alive) if (k === a || best[k] === a || best[k] === b || !canMerge(k, best[k])) findBest(k);
+    for (const k of alive) if (k !== a && canMerge(k, a) && best[k] >= 0 && sim[k][a] > sim[k][best[k]]) best[k] = a;
   }
+
+  // Name groups: joined speaker first, then whichever current label
+  // most of the group already has, so numbers and renames stay put.
+  const final = [...alive].map((g) => groups[g]);
+  const taken = new Set();
+  const label = new Map();
+  for (const g of final) if (g.pin) { label.set(g, g.pin); taken.add(g.pin); }
+  const votes = [];
+  for (const g of final) {
+    if (g.pin) continue;
+    const c = new Map();
+    for (const i of g.m) c.set(items[i].spk, (c.get(items[i].spk) || 0) + 1);
+    for (const [spk, k] of c) votes.push({ g, spk, k });
+  }
+  votes.sort((x, y) => y.k - x.k);
+  for (const v of votes) if (!label.has(v.g) && !taken.has(v.spk)) { label.set(v.g, v.spk); taken.add(v.spk); }
+  // Brand-new groups skip numbers hand-moved lines already use.
+  const handLabels = new Set(S.lines.filter((l) => l.manual).map((l) => l.spk));
+  let next = 1;
+  for (const g of final) {
+    if (label.has(g)) continue;
+    while (taken.has(next) || handLabels.has(next)) next++;
+    label.set(g, next); taken.add(next);
+  }
+  let changed = false;
+  for (const g of final) {
+    const spk = label.get(g);
+    for (const i of g.m) if (items[i].spk !== spk) { items[i].spk = spk; changed = true; }
+  }
+  return changed;
 }
 
 function mergeSpeaker(from, into) {
-  for (const l of S.lines) if (l.spk === from) l.spk = into;
+  for (const l of S.lines) {
+    if (l.spk === from) l.spk = into;
+    if (l.spk === into && !l.manual) l.anchor = into; // the user said these are one person
+  }
   if (!S.names[into] && S.names[from]) S.names[into] = S.names[from];
   delete S.names[from];
 }
 
-// After the meeting, with every voice sample in hand, re-check who said what.
-function refineSpeakers() {
-  const withEmb = S.lines.filter((l) => l.emb && !l.manual);
-  if (withEmb.length < 3) return;
-  const vecs = new Map(withEmb.map((l) => [l.id, normalize(l.emb)]));
-  // 1. Move each clip to the voice it is closest to overall.
-  for (let iter = 0; iter < 5; iter++) {
-    rebuildCentroids();
-    let changed = false;
-    for (const l of withEmb) {
-      const v = vecs.get(l.id);
-      let best = l.spk, bestSim = -1;
-      centroids.forEach((c, i) => {
-        if (!c.sum || c.n === 0) return;
-        const sim = cosine(v, c.sum);
-        if (sim > bestSim) { bestSim = sim; best = i + 1; }
-      });
-      if (best !== l.spk) { l.spk = best; changed = true; }
-    }
-    if (!changed) break;
-  }
-  // 2. Merge the two closest voices while they sound alike, or while there
-  //    are more speakers than people in the room.
-  for (;;) {
-    rebuildCentroids();
-    const live = centroids.map((c, i) => ({ c, spk: i + 1 })).filter((x) => x.c.sum && x.c.n);
-    let pair = null;
-    for (let a = 0; a < live.length; a++) {
-      for (let b = a + 1; b < live.length; b++) {
-        const sim = cosine(live[a].c.sum, live[b].c.sum);
-        if (!pair || sim > pair.sim) pair = { a: live[a], b: live[b], sim };
-      }
-    }
-    if (!pair) break;
-    const tooMany = S.people > 0 && live.length > S.people;
-    if (pair.sim < MERGE_SPEAKERS && !tooMany) break;
-    // Keep the speaker with more clips (and so the more reliable number/name).
-    const [keep, drop] = pair.a.c.n >= pair.b.c.n ? [pair.a, pair.b] : [pair.b, pair.a];
-    mergeSpeaker(drop.spk, keep.spk);
-  }
-  renumberSpeakers();
+function maxSpeaker() {
+  return S.lines.reduce((m, l) => Math.max(m, l.spk), 0);
 }
 
 // Make speakers 1..k in order of first appearance, carrying names along.
@@ -219,9 +232,11 @@ function renumberSpeakers() {
   for (const l of S.lines) if (!map.has(l.spk)) map.set(l.spk, map.size + 1);
   const names = {};
   for (const [oldN, newN] of map) if (S.names[oldN]) names[newN] = S.names[oldN];
-  for (const l of S.lines) l.spk = map.get(l.spk);
+  for (const l of S.lines) {
+    l.spk = map.get(l.spk);
+    if (l.anchor) l.anchor = l.spk;
+  }
   S.names = names;
-  rebuildCentroids();
 }
 
 // ---------- segmenter (voice activity detection) ----------
@@ -359,7 +374,8 @@ function stop() {
 }
 
 function finish() {
-  refineSpeakers();
+  clusterSpeakers();
+  renumberSpeakers();
   renderAllLines();
   renderSpeakers();
   save();
@@ -386,7 +402,6 @@ function newMeeting() {
   if (S.lines.length && !confirm('Começar uma nova reunião? A transcrição atual será apagada desta tela. Baixe o .txt antes se quiser guardá-la.')) return;
   Object.assign(S, { status: 'idle', title: 'Consulta com cliente', startedAt: null, samples: 0, lines: [], names: {} });
   pending.clear();
-  centroids = [];
   el.lines.innerHTML = '';
   lineEls.clear();
   el.title.value = S.title;
@@ -437,7 +452,7 @@ const files = new Map();
 function startWorker() {
   if (worker) worker.terminate();
   files.clear();
-  worker = new Worker('worker.js?v=3', { type: 'module' });
+  worker = new Worker('worker.js?v=5', { type: 'module' });
   worker.onmessage = onWorker;
   worker.onerror = (e) => {
     console.error(e);
@@ -483,11 +498,14 @@ function onResult(m) {
   if (m.error) console.warn('segment failed', m.error);
   const text = p ? cleanText(m.text) : '';
   if (text) {
-    const line = { id: m.id, t: p.t, text, spk: assignSpeaker(m.emb, p.dur), d: p.dur, marked: p.marked, emb: m.emb ? m.emb.map((x) => Math.round(x * 1e4) / 1e4) : null };
+    const line = { id: m.id, t: p.t, text, spk: maxSpeaker() + 1, d: p.dur, marked: p.marked, emb: m.emb ? m.emb.map((x) => Math.round(x * 1e4) / 1e4) : null };
     // Results arrive in order, but keep the transcript sorted by time anyway.
     S.lines.push(line);
     S.lines.sort((a, b) => a.t - b.t);
-    renderLine(line);
+    // No voice print (rare): assume the previous speaker kept talking.
+    if (!line.emb) { const prev = S.lines[S.lines.indexOf(line) - 1]; line.spk = prev ? prev.spk : 1; }
+    clusterSpeakers();
+    renderAllLines();
     renderSpeakers();
     save();
   }
@@ -544,7 +562,7 @@ function renderAllLines() {
 function pickSpeaker(line, anchor) {
   const sel = document.createElement('select');
   sel.className = 'spk';
-  const count = Math.max(centroids.length, ...S.lines.map((l) => l.spk));
+  const count = maxSpeaker();
   for (let n = 1; n <= count; n++) sel.add(new Option(speakerName(n), n, false, n === line.spk));
   sel.add(new Option('+ Novo falante', count + 1));
   anchor.replaceWith(sel);
@@ -558,8 +576,8 @@ function pickSpeaker(line, anchor) {
     if (n !== line.spk) {
       line.spk = n;
       line.manual = true;
-      rebuildCentroids();
-      renderLine(line);
+      clusterSpeakers();
+      renderAllLines();
       renderSpeakers();
       save();
     }
@@ -604,6 +622,7 @@ function renderSpeakers() {
       const into = Number(merge.value);
       if (!into) return;
       mergeSpeaker(n, into);
+      clusterSpeakers();
       renumberSpeakers();
       renderAllLines();
       renderSpeakers();
@@ -685,7 +704,6 @@ function restore() {
     if (S.status === 'idle' && S.lines.length) S.status = 'paused';
     el.title.value = S.title;
     el.people.value = String(S.people || 0);
-    rebuildCentroids();
     renderAllLines();
     renderSpeakers();
   } catch (e) { console.warn('restore failed', e); }
@@ -705,8 +723,8 @@ el.title.addEventListener('input', () => { S.title = el.title.value; save(); });
 el.people.addEventListener('change', () => {
   S.people = Number(el.people.value);
   // Already more voices than people? Fold the closest ones together now.
-  if (S.people && new Set(S.lines.map((l) => l.spk)).size > S.people) {
-    refineSpeakers();
+  if (S.lines.length) {
+    clusterSpeakers();
     renderAllLines();
     renderSpeakers();
     render();
@@ -732,6 +750,7 @@ startWorker();
 // Test hook: /?debug then __feed('file.wav') runs a recording through the same pipeline.
 if (new URLSearchParams(location.search).has('debug')) {
   window.__S = S;
+  window.__cluster = clusterSpeakers;
   window.__feed = async (url) => {
     const buf = await (await fetch(url)).arrayBuffer();
     const decoded = await new AudioContext().decodeAudioData(buf);
@@ -745,6 +764,28 @@ if (new URLSearchParams(location.search).has('debug')) {
     S.status = 'rec';
     render();
     for (let i = 0; i + FRAME <= mono.length; i += FRAME) onFrame(mono.slice(i, i + FRAME));
+    stop();
+  };
+  // Same, but through audio-processor.js at a laptop mic's 48 kHz, like a live meeting.
+  window.__feedMic = async (url, rate = 48000) => {
+    const buf = await (await fetch(url)).arrayBuffer();
+    const off = new OfflineAudioContext(1, 1, rate);
+    const decoded = await off.decodeAudioData(buf);
+    const ctx = new OfflineAudioContext(1, decoded.length, rate);
+    await ctx.audioWorklet.addModule('audio-processor.js?v=' + Date.now());
+    const node = new AudioWorkletNode(ctx, 'downsampler');
+    const frames = [];
+    node.port.onmessage = (e) => frames.push(e.data);
+    const src = ctx.createBufferSource();
+    src.buffer = decoded;
+    src.connect(node).connect(ctx.destination);
+    src.start();
+    await ctx.startRendering();
+    await new Promise((r) => setTimeout(r, 500)); // let the last frames arrive
+    if (!S.startedAt) S.startedAt = Date.now();
+    S.status = 'rec';
+    render();
+    for (const f of frames) onFrame(f);
     stop();
   };
 }

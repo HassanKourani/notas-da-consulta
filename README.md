@@ -37,11 +37,14 @@ mic → audio-processor.js (AudioWorklet, 16 kHz frames)
 
 She can switch quality under "Reconhecimento de voz".
 
-**Speaker matching** (`app.js`, speakers section):
-- A clip joins the speaker it best matches. The match is scored against both that speaker's average voice and their closest earlier clip.
-- A new speaker is only created when the clip is clearly unlike everyone (cosine < 0.25), the clip is at least 2 s long, and the "Pessoas na reunião" count hasn't been reached yet.
-- At "Encerrar", clips are reassigned to their closest voice. Speakers whose voices are ≥ 0.35 alike are then merged, and so are speakers beyond the people count.
-- If one person still shows up twice, "Juntar com…" in the Falantes panel merges them.
+**Speaker matching** (`app.js`, `clusterSpeakers`):
+- Each time a sentence arrives, all voice prints so far are regrouped with average-linkage clustering. Groups at least 0.18 alike are treated as the same person.
+- A sentence-by-sentence approach failed on real voices. On short clips the same person scored 0.12–0.9 and different people up to 0.23, so early guesses locked in.
+- If "Pessoas na reunião" is set, merging continues until that count is reached.
+- Labels follow the majority of each group's previous labels, so numbers and renames stay stable as groups change.
+- A line moved by hand is left out of the grouping and keeps its speaker.
+- Speakers joined with "Juntar com…" become one group that new sentences can still join.
+- Cost: about 0.2 s per sentence at 900 sentences (a meeting of over an hour).
 
 **Speaker separation limits.** Overlapping speech gets one label. Very short replies ("sim") may land on the wrong speaker. The fix is one click on that line.
 
@@ -62,11 +65,25 @@ It must be served over `http://localhost` or `https://`. Browsers block the micr
 
 ## Tested
 
-- `test/conversa.wav`: a 56 s, 9-turn conversation with two macOS pt-BR voices (Luciana, Eddy).
-- Alta model on WebGPU: near-perfect text, all 9 speakers correct, about 20 s of processing for 56 s of audio. The earlier fp16 build (1.6 GB) crashed the test browser while loading, which is why it's now 4-bit.
-- Leve model on WebGPU: a few word errors ("Obrigada por ver"), all 9 speakers correct, about 10 s of processing.
-- Similarity margin: the same voice scored 0.72–0.95, different voices ≤ 0.07.
-- `test/sala.wav` (same conversation with room echo and noise): speakers stay separable (same 0.58–0.77, different ≤ 0.13), but the text degrades.
-- `test/variado.wav`: the lawyer's voice changes pitch and speed. Her own clips score as low as 0.32 against each other, under the old 0.4 cutoff. All 8 turns were assigned correctly.
-- Manual line move, "Juntar com…" and the people cap (3 forced speakers with the count set to 2) all fold back to the correct 2.
-- Not tested yet: a real microphone in a real room (the test browser blocks the mic).
+Most of the speaker testing below uses real voices. The macOS computer voices are too consistent to expose speaker problems.
+
+- **Real voices** (`test/real{1,2,3,4}.wav` + `.json` with the true speaker for each turn):
+  - Turns are cut from Multilingual LibriSpeech Portuguese (CC BY 4.0) and mixed at 48 kHz with mic hiss.
+  - The `.wav` files are local only (git-ignored). The `.json` files list who speaks when.
+  - Each is fed through the real mic path with `__feedMic(...)`.
+
+| Speakers | Old (one at a time) | New (group everything) | Most speakers shown live |
+|---|---|---|---|
+| 1 | not run (it was the reported bug) | 1 speaker, 0% wrong | 1 |
+| 2 | 0% wrong | 0% wrong | 2 |
+| 3 | 21% wrong | 0% wrong | 3 |
+| 4 | 23% wrong | 0% wrong | 4 |
+
+  With the people count set (2 and 4) it was also 0% wrong. On these files a cutoff of 0.15–0.20 is perfect, 0.25+ splits people, and 0.10 merges them.
+
+- **Synthetic** (macOS pt-BR voices):
+  - `conversa.wav`: 9 turns, near-perfect text with the Alta model, about 20 s of processing for 56 s of audio.
+  - `sala.wav`: room echo and noise. The text degrades.
+  - `variado.wav`: one voice changing pitch and speed.
+- **Manual fixes:** moving a line, "Juntar com…" and the people cap all hold when the grouping re-runs.
+- **Not tested:** a real microphone in a real room (the test browser blocks the mic).
