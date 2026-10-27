@@ -426,7 +426,9 @@ function onWorker(e) {
   if (m.type === 'loading') {
     const size = m.quality === 'alta' ? '~600 MB' : '~300 MB';
     engineDesc = `${m.quality === 'alta' ? 'Alta' : 'Leve'} · ${m.device === 'webgpu' ? 'placa de vídeo' : 'processador'}`;
-    el.engineText.textContent = `Baixando o modelo de voz (${size}, só na primeira vez)…`;
+    el.engineText.textContent = m.cached
+      ? 'Carregando o modelo de voz salvo neste computador…'
+      : `Baixando o modelo de voz (${size}, só na primeira vez)…`;
   } else if (m.type === 'progress') {
     files.set(m.file, m);
     let loaded = 0, total = 0;

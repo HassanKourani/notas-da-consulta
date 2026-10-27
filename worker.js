@@ -60,6 +60,17 @@ async function pickConfig(quality) {
   return { quality: 'leve', model: 'onnx-community/whisper-small', device: 'wasm', dtype: 'q8' };
 }
 
+// transformers.js keeps downloaded model files in this Cache Storage bucket.
+async function isCached(model) {
+  try {
+    const cache = await caches.open('transformers-cache');
+    const keys = await cache.keys();
+    return keys.some((r) => r.url.includes(model) && r.url.includes('.onnx'));
+  } catch {
+    return false;
+  }
+}
+
 function progress(p) {
   if (p.status === 'progress' && p.total) {
     self.postMessage({ type: 'progress', file: p.file, loaded: p.loaded, total: p.total });
@@ -68,7 +79,7 @@ function progress(p) {
 
 async function load(quality) {
   const cfg = await pickConfig(quality);
-  self.postMessage({ type: 'loading', ...cfg });
+  self.postMessage({ type: 'loading', ...cfg, cached: await isCached(cfg.model) });
   asr = await pipeline('automatic-speech-recognition', cfg.model, {
     device: cfg.device,
     dtype: cfg.dtype,
