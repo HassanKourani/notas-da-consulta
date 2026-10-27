@@ -41,6 +41,11 @@ She can switch quality under "Reconhecimento de voz".
 
 **Phantom subtitles.** Whisper sometimes outputs fake subtitle credits ("Legendas pela comunidade Amara.org") on noise. These are filtered in `app.js` (`JUNK`).
 
+## Live link
+
+https://hassankourani.github.io/notas-da-consulta/ (GitHub Pages, from `main`).
+When you change `app.js`, `worker.js` or `styles.css`, bump the `?v=` in `index.html` and `app.js`. Otherwise browsers can keep the old file for up to 10 minutes.
+
 ## Running it
 
 It must be served over `http://localhost` or `https://`. Browsers block the microphone and web workers on `file://`.
