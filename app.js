@@ -8,10 +8,16 @@ const FRAME = 512;
 const STORE_KEY = 'notas-consulta:v1';
 const QUALITY_KEY = 'notas-consulta:quality';
 
-// Cosine similarity above which two utterances count as the same voice.
-// Synthetic test voices: same speaker 0.72-0.95, different <0.1. Real voices
-// through a laptop mic score lower, so err toward merging rather than splitting.
-const SAME_SPEAKER = 0.4;
+// Voice-print similarity (cosine). Synthetic test voices: same speaker 0.58-0.95
+// (clean and with room noise), different <0.15. Real people vary more (tone,
+// posture, distance), so a new speaker is only created when a clip is clearly
+// unlike everyone so far; anything in between goes to the closest known voice.
+const NEW_SPEAKER = 0.25;
+// After the meeting, groups whose voices are at least this close are merged.
+const MERGE_SPEAKERS = 0.35;
+// Clips shorter than this ("sim", "uhum") give unreliable voice prints and
+// never start a new speaker.
+const MIN_NEW_SPEAKER_SECONDS = 2;
 const SPEAKER_COLORS = ['#1F3A5F', '#0F6B5C', '#8A4B00', '#6B3FA0', '#A0325A', '#3F6B1F', '#5B616E'];
 
 const CLAUDE_PROMPT = `Você é assistente de uma advogada brasileira. Abaixo está a transcrição automática de uma reunião presencial com cliente(s).
@@ -55,6 +61,7 @@ const S = {
   lines: [], // { id, t, text, spk, marked, emb }
   names: {}, // speaker number -> custom name
   nextId: 1,
+  people: 0, // expected number of people in the room; 0 = detect automatically
 };
 const pending = new Map(); // segment id -> { t, marked }
 let centroids = []; // index = speaker - 1; { sum: Float64Array, n }
@@ -70,7 +77,7 @@ const el = {
   listening: $('listening'), listeningText: $('listeningText'), pausedNote: $('pausedNote'),
   speakers: $('speakers'), noSpeakers: $('noSpeakers'),
   engineText: $('engineText'), progressWrap: $('progressWrap'), progressBar: $('progressBar'),
-  quality: $('quality'), toast: $('toast'),
+  quality: $('quality'), toast: $('toast'), people: $('people'),
 };
 
 // ---------- helpers ----------
@@ -114,19 +121,29 @@ function cleanText(t) {
 }
 
 // ---------- speakers ----------
-function assignSpeaker(emb) {
-  if (!emb) return centroids.length ? 1 : addCentroid(null);
-  const v = normalize(emb);
-  let best = -1, bestSim = -1;
-  centroids.forEach((c, i) => {
-    const sim = cosine(v, c.sum);
-    if (sim > bestSim) { bestSim = sim; best = i; }
+// How well a voice print matches each known speaker: the better of the
+// speaker's average voice and their single closest earlier clip, so one person
+// whose tone varies over the meeting still matches.
+function speakerScores(v) {
+  return centroids.map((c, i) => {
+    if (!c.sum || !c.n) return { spk: i + 1, sim: -1 };
+    let sim = cosine(v, c.sum);
+    for (const l of S.lines) if (l.spk === i + 1 && l.emb) sim = Math.max(sim, cosine(v, l.emb));
+    return { spk: i + 1, sim };
   });
-  if (best >= 0 && bestSim >= SAME_SPEAKER) {
-    const c = centroids[best];
+}
+
+function assignSpeaker(emb, dur) {
+  const last = S.lines.length ? S.lines[S.lines.length - 1].spk : 0;
+  if (!emb) return last || addCentroid(null);
+  const v = normalize(emb);
+  const best = speakerScores(v).reduce((a, b) => (b.sim > a.sim ? b : a), { spk: 0, sim: -1 });
+  const full = S.people > 0 && centroids.length >= S.people;
+  if (best.spk && (best.sim >= NEW_SPEAKER || dur < MIN_NEW_SPEAKER_SECONDS || full)) {
+    const c = centroids[best.spk - 1];
     for (let i = 0; i < v.length; i++) c.sum[i] += v[i];
     c.n++;
-    return best + 1;
+    return best.spk;
   }
   return addCentroid(v);
 }
@@ -147,12 +164,18 @@ function rebuildCentroids() {
   }
 }
 
+function mergeSpeaker(from, into) {
+  for (const l of S.lines) if (l.spk === from) l.spk = into;
+  if (!S.names[into] && S.names[from]) S.names[into] = S.names[from];
+  delete S.names[from];
+}
+
 // After the meeting, with every voice sample in hand, re-check who said what.
-// Keeps speaker numbers stable so any renames still apply.
 function refineSpeakers() {
   const withEmb = S.lines.filter((l) => l.emb && !l.manual);
   if (withEmb.length < 3) return;
   const vecs = new Map(withEmb.map((l) => [l.id, normalize(l.emb)]));
+  // 1. Move each clip to the voice it is closest to overall.
   for (let iter = 0; iter < 5; iter++) {
     rebuildCentroids();
     let changed = false;
@@ -168,17 +191,24 @@ function refineSpeakers() {
     }
     if (!changed) break;
   }
-  // Merge voices that turned out to be the same person.
-  rebuildCentroids();
-  for (let a = 0; a < centroids.length; a++) {
-    for (let b = a + 1; b < centroids.length; b++) {
-      const ca = centroids[a], cb = centroids[b];
-      if (!ca.sum || !cb.sum || !ca.n || !cb.n) continue;
-      if (cosine(ca.sum, cb.sum) >= SAME_SPEAKER + 0.1) {
-        for (const l of S.lines) if (l.spk === b + 1) l.spk = a + 1;
-        rebuildCentroids();
+  // 2. Merge the two closest voices while they sound alike, or while there
+  //    are more speakers than people in the room.
+  for (;;) {
+    rebuildCentroids();
+    const live = centroids.map((c, i) => ({ c, spk: i + 1 })).filter((x) => x.c.sum && x.c.n);
+    let pair = null;
+    for (let a = 0; a < live.length; a++) {
+      for (let b = a + 1; b < live.length; b++) {
+        const sim = cosine(live[a].c.sum, live[b].c.sum);
+        if (!pair || sim > pair.sim) pair = { a: live[a], b: live[b], sim };
       }
     }
+    if (!pair) break;
+    const tooMany = S.people > 0 && live.length > S.people;
+    if (pair.sim < MERGE_SPEAKERS && !tooMany) break;
+    // Keep the speaker with more clips (and so the more reliable number/name).
+    const [keep, drop] = pair.a.c.n >= pair.b.c.n ? [pair.a, pair.b] : [pair.b, pair.a];
+    mergeSpeaker(drop.spk, keep.spk);
   }
   renumberSpeakers();
 }
@@ -252,7 +282,7 @@ function flushSegment() {
   const audio = new Float32Array(frames.length * FRAME);
   frames.forEach((f, i) => audio.set(f, i * FRAME));
   const id = S.nextId++;
-  pending.set(id, { t, marked });
+  pending.set(id, { t, marked, dur: audio.length / SR });
   worker.postMessage({ type: 'segment', id, audio }, [audio.buffer]);
   renderStatus();
 }
@@ -407,7 +437,7 @@ const files = new Map();
 function startWorker() {
   if (worker) worker.terminate();
   files.clear();
-  worker = new Worker('worker.js?v=2', { type: 'module' });
+  worker = new Worker('worker.js?v=3', { type: 'module' });
   worker.onmessage = onWorker;
   worker.onerror = (e) => {
     console.error(e);
@@ -453,7 +483,7 @@ function onResult(m) {
   if (m.error) console.warn('segment failed', m.error);
   const text = p ? cleanText(m.text) : '';
   if (text) {
-    const line = { id: m.id, t: p.t, text, spk: assignSpeaker(m.emb), marked: p.marked, emb: m.emb ? m.emb.map((x) => Math.round(x * 1e4) / 1e4) : null };
+    const line = { id: m.id, t: p.t, text, spk: assignSpeaker(m.emb, p.dur), d: p.dur, marked: p.marked, emb: m.emb ? m.emb.map((x) => Math.round(x * 1e4) / 1e4) : null };
     // Results arrive in order, but keep the transcript sorted by time anyway.
     S.lines.push(line);
     S.lines.sort((a, b) => a.t - b.t);
@@ -519,7 +549,10 @@ function pickSpeaker(line, anchor) {
   sel.add(new Option('+ Novo falante', count + 1));
   anchor.replaceWith(sel);
   sel.focus();
+  let closed = false;
   const done = () => {
+    if (closed) return;
+    closed = true;
     const n = Number(sel.value);
     sel.replaceWith(anchor);
     if (n !== line.spk) {
@@ -531,8 +564,8 @@ function pickSpeaker(line, anchor) {
       save();
     }
   };
-  sel.addEventListener('change', () => sel.blur());
-  sel.addEventListener('blur', done, { once: true });
+  sel.addEventListener('change', done);
+  sel.addEventListener('blur', done);
 }
 
 function renderSpeakers() {
@@ -560,10 +593,28 @@ function renderSpeakers() {
     });
     input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') input.blur(); });
     input.addEventListener('blur', () => setTimeout(renderSpeakers));
+    const merge = document.createElement('select');
+    merge.className = 'merge';
+    merge.title = 'Se for a mesma pessoa, junte as falas';
+    merge.setAttribute('aria-label', `Juntar ${speakerName(n)} com outro falante`);
+    merge.add(new Option('Juntar com…', ''));
+    for (const o of ids) if (o !== n) merge.add(new Option(speakerName(o), o));
+    merge.hidden = ids.length < 2;
+    merge.addEventListener('change', () => {
+      const into = Number(merge.value);
+      if (!into) return;
+      mergeSpeaker(n, into);
+      renumberSpeakers();
+      renderAllLines();
+      renderSpeakers();
+      render();
+      save();
+      flash('Falantes unidos');
+    });
     const c = document.createElement('span');
     c.className = 'muted';
     c.textContent = `${counts.get(n)} ${counts.get(n) === 1 ? 'fala' : 'falas'}`;
-    li.append(sw, input, c);
+    li.append(sw, input, c, merge);
     el.speakers.append(li);
   }
 }
@@ -617,7 +668,7 @@ function save() {
   saveT = setTimeout(() => {
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify({
-        title: S.title, startedAt: S.startedAt, samples: S.samples, lines: S.lines,
+        title: S.title, startedAt: S.startedAt, samples: S.samples, lines: S.lines, people: S.people,
         names: S.names, nextId: S.nextId, status: S.status,
       }));
     } catch (e) { console.warn('save failed', e); }
@@ -633,6 +684,7 @@ function restore() {
     if (S.status === 'rec') S.status = 'paused';
     if (S.status === 'idle' && S.lines.length) S.status = 'paused';
     el.title.value = S.title;
+    el.people.value = String(S.people || 0);
     rebuildCentroids();
     renderAllLines();
     renderSpeakers();
@@ -650,6 +702,17 @@ el.copy.onclick = () => copyText(asText(), 'Transcrição copiada');
 el.download.onclick = download;
 el.claude.onclick = () => copyText(CLAUDE_PROMPT + '\n' + asText(), 'Copiado. Agora cole no Claude (Cmd/Ctrl + V).');
 el.title.addEventListener('input', () => { S.title = el.title.value; save(); });
+el.people.addEventListener('change', () => {
+  S.people = Number(el.people.value);
+  // Already more voices than people? Fold the closest ones together now.
+  if (S.people && new Set(S.lines.map((l) => l.spk)).size > S.people) {
+    refineSpeakers();
+    renderAllLines();
+    renderSpeakers();
+    render();
+  }
+  save();
+});
 
 try { el.quality.value = localStorage.getItem(QUALITY_KEY) || 'auto'; } catch { /* ignore */ }
 el.quality.addEventListener('change', () => {

@@ -25,7 +25,7 @@ mic → audio-processor.js (AudioWorklet, 16 kHz frames)
     → worker.js
         - Whisper: text
         - WeSpeaker ResNet34: 256-d voice fingerprint
-    → app.js online speaker clustering (cosine ≥ 0.4) → transcript
+    → app.js speaker matching → transcript
 ```
 
 **Models.** They're downloaded once from Hugging Face and cached by the browser. They run with transformers.js 4.2.0 from the jsDelivr CDN.
@@ -37,7 +37,13 @@ mic → audio-processor.js (AudioWorklet, 16 kHz frames)
 
 She can switch quality under "Reconhecimento de voz".
 
-**Speaker separation.** Overlapping speech gets one label. Very short replies ("sim") may land on the wrong speaker. The fix is one click on that line.
+**Speaker matching** (`app.js`, speakers section):
+- A clip joins the speaker it best matches. The match is scored against both that speaker's average voice and their closest earlier clip.
+- A new speaker is only created when the clip is clearly unlike everyone (cosine < 0.25), the clip is at least 2 s long, and the "Pessoas na reunião" count hasn't been reached yet.
+- At "Encerrar", clips are reassigned to their closest voice. Speakers whose voices are ≥ 0.35 alike are then merged, and so are speakers beyond the people count.
+- If one person still shows up twice, "Juntar com…" in the Falantes panel merges them.
+
+**Speaker separation limits.** Overlapping speech gets one label. Very short replies ("sim") may land on the wrong speaker. The fix is one click on that line.
 
 **Phantom subtitles.** Whisper sometimes outputs fake subtitle credits ("Legendas pela comunidade Amara.org") on noise. These are filtered in `app.js` (`JUNK`).
 
@@ -60,4 +66,7 @@ It must be served over `http://localhost` or `https://`. Browsers block the micr
 - Alta model on WebGPU: near-perfect text, all 9 speakers correct, about 20 s of processing for 56 s of audio. The earlier fp16 build (1.6 GB) crashed the test browser while loading, which is why it's now 4-bit.
 - Leve model on WebGPU: a few word errors ("Obrigada por ver"), all 9 speakers correct, about 10 s of processing.
 - Similarity margin: the same voice scored 0.72–0.95, different voices ≤ 0.07.
+- `test/sala.wav` (same conversation with room echo and noise): speakers stay separable (same 0.58–0.77, different ≤ 0.13), but the text degrades.
+- `test/variado.wav`: the lawyer's voice changes pitch and speed. Her own clips score as low as 0.32 against each other, under the old 0.4 cutoff. All 8 turns were assigned correctly.
+- Manual line move, "Juntar com…" and the people cap (3 forced speakers with the count set to 2) all fold back to the correct 2.
 - Not tested yet: a real microphone in a real room (the test browser blocks the mic).
