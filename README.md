@@ -40,7 +40,10 @@ She can switch quality under "Reconhecimento de voz".
 **Speaker matching** (`app.js`, `clusterSpeakers`):
 - Each time a sentence arrives, all voice prints so far are regrouped with average-linkage clustering. Groups at least 0.18 alike are treated as the same person.
 - A sentence-by-sentence approach failed on real voices. On short clips the same person scored 0.12–0.9 and different people up to 0.23, so early guesses locked in.
-- If "Pessoas na reunião" is set, merging continues until that count is reached.
+- "Pessoas na reunião" defaults to 2 (lawyer + client). When a count is set and there are at least 6 sentences, groups merge to exactly that many, ignoring the cutoff.
+  - No fixed cutoff works for everyone. Two similar women need 0.30 or more to separate, but at 0.30 other groups split into extra speakers.
+  - Knowing the count separated every real test perfectly.
+- "Não sei (detectar)" uses the 0.18 cutoff. It handles one person alone and distinct voices, but merges similar voices (see Tested).
 - Labels follow the majority of each group's previous labels, so numbers and renames stay stable as groups change.
 - A line moved by hand is left out of the grouping and keeps its speaker.
 - Speakers joined with "Juntar com…" become one group that new sentences can still join.
@@ -49,6 +52,15 @@ She can switch quality under "Reconhecimento de voz".
 **Speaker separation limits.** Overlapping speech gets one label. Very short replies ("sim") may land on the wrong speaker. The fix is one click on that line.
 
 **Phantom subtitles.** Whisper sometimes outputs fake subtitle credits ("Legendas pela comunidade Amara.org") on noise. These are filtered in `app.js` (`JUNK`).
+
+## Branding
+
+- **Client:** RB Advocacia e Consultoria Jurídica. The logo is `assets/logo.png`, resized from `logo_gold_sem fundo.png`.
+- **Colours** (tokens in `styles.css`):
+  - Gold `#C4A45D`, sampled from the logo, for fills and accents, with dark text on top (7.3:1).
+  - Gold text `#7D6224` (5.8:1 on white). Plain gold text on white is only 2.4:1.
+  - Charcoal `#2B2519` and ivory `#F8F5EE`.
+- **Fonts:** Marcellus for titles, the closest free match to the logo's flared serif (the logo's exact font is unknown). Inter for body text.
 
 ## Live link
 
@@ -72,14 +84,19 @@ Most of the speaker testing below uses real voices. The macOS computer voices ar
   - The `.wav` files are local only (git-ignored). The `.json` files list who speaks when.
   - Each is fed through the real mic path with `__feedMic(...)`.
 
-| Speakers | Old (one at a time) | New (group everything) | Most speakers shown live |
-|---|---|---|---|
-| 1 | not run (it was the reported bug) | 1 speaker, 0% wrong | 1 |
-| 2 | 0% wrong | 0% wrong | 2 |
-| 3 | 21% wrong | 0% wrong | 3 |
-| 4 | 23% wrong | 0% wrong | 4 |
+| Test | Voices | Old (one at a time) | 0.18 cutoff ("Não sei") | Count set (default 2) |
+|---|---|---|---|---|
+| real1 | 1 person | not run | 0% wrong | n/a |
+| real2 | 2 men, distinct | 0% | 0% | 0% |
+| realM | 2 men, similar pitch | — | 0% | 0% |
+| realF1 | 2 women, similar | — | **47% wrong (merged)** | 0% |
+| realF2 | 2 women, similar | — | **46% wrong (merged)** | 0% |
+| real3 | 3 people | 21% | 0% | 0% |
+| real4 | 4 people | 23% | 0% | 0% |
 
-  With the people count set (2 and 4) it was also 0% wrong. On these files a cutoff of 0.15–0.20 is perfect, 0.25+ splits people, and 0.10 merges them.
+  - The live view never showed more speakers than the true number when the count was set.
+  - The realF tests reproduce the lawyer's report ("uma hora eu sou falante 1 e outra hora a cliente é falante 1").
+  - Women were picked by estimated pitch: speakers 11247, 9056 and 12114 (about 240–260 Hz).
 
 - **Synthetic** (macOS pt-BR voices):
   - `conversa.wav`: 9 turns, near-perfect text with the Alta model, about 20 s of processing for 56 s of audio.

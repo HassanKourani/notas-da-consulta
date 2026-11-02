@@ -3,18 +3,18 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Notas da Consulta</title>
+<title>Notas da Consulta · RB Advocacia</title>
+<link rel="icon" href="assets/logo.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css?v=5">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Marcellus&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css?v=7">
 </head>
 <body>
 <div class="page">
   <header class="top">
     <div class="brand">
-      <div class="logo">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"></rect><path d="M5 10a7 7 0 0 0 14 0"></path><path d="M12 17v4"></path></svg>
-      </div>
+      <img class="logo" src="assets/logo.png" alt="RB Advocacia e Consultoria Jurídica">
+      <span class="brand-divider" aria-hidden="true"></span>
       <div class="brand-text">
         <span class="brand-name">Notas da Consulta</span>
         <span class="muted small">Transcrição de reuniões presenciais</span>
@@ -34,8 +34,8 @@
       <span class="muted small" id="meta"></span>
       <label class="muted small people">Pessoas na reunião
         <select id="people">
-          <option value="0">Detectar automaticamente</option>
-          <option value="2">2</option>
+          <option value="0">Não sei (detectar)</option>
+          <option value="2" selected>2</option>
           <option value="3">3</option>
           <option value="4">4</option>
           <option value="5">5</option>
@@ -80,7 +80,7 @@
       </div>
       <div id="list" class="list">
         <div id="empty" class="empty">
-          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#8A8F99" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"></rect><path d="M5 10a7 7 0 0 0 14 0"></path><path d="M12 17v4"></path></svg>
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#C4A45D" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"></rect><path d="M5 10a7 7 0 0 0 14 0"></path><path d="M12 17v4"></path></svg>
           <p class="empty-title">Pronto para quando a reunião começar</p>
           <p class="empty-text">Coloque o aparelho sobre a mesa e toque em Começar a ouvir. A conversa aparece aqui conforme as pessoas falam.</p>
         </div>
@@ -105,8 +105,9 @@
 
       <section class="card side-card">
         <h2>Falantes</h2>
-        <p id="noSpeakers" class="muted small-14">As vozes diferentes aparecem aqui como Falante 1, 2, 3. Clique no nome para trocar. Se a mesma pessoa aparecer duas vezes, use “Juntar com…”.</p>
+        <p id="noSpeakers" class="muted small-14">As vozes aparecem aqui como Falante 1, 2, 3. Clique no nome para trocar.</p>
         <ul id="speakers" class="speakers"></ul>
+        <p class="muted small-14">Dica: informe em “Pessoas na reunião” quantas pessoas vão falar. Vozes parecidas só se separam bem assim. Se a mesma pessoa aparecer duas vezes, use “Juntar com…”.</p>
       </section>
 
       <section class="card side-card">
@@ -128,6 +129,6 @@
   </div>
 </div>
 <div id="toast" class="toast" role="status" hidden></div>
-<script type="module" src="app.js?v=5"></script>
+<script type="module" src="app.js?v=7"></script>
 </body>
 </html>

@@ -13,7 +13,7 @@ const QUALITY_KEY = 'notas-consulta:quality';
 // separated 2, 3 and 4 speakers with no errors; 0.25+ starts splitting people,
 // 0.10 merges them. See README "Tested".
 const SAME_SPEAKER = 0.18;
-const SPEAKER_COLORS = ['#1F3A5F', '#0F6B5C', '#8A4B00', '#6B3FA0', '#A0325A', '#3F6B1F', '#5B616E'];
+const SPEAKER_COLORS = ['#7D6224', '#0F6B5C', '#2B4A7A', '#8A3B5A', '#5A4A8A', '#3F6B1F', '#6B6355'];
 
 const CLAUDE_PROMPT = `Você é assistente de uma advogada brasileira. Abaixo está a transcrição automática de uma reunião presencial com cliente(s).
 
@@ -56,7 +56,7 @@ const S = {
   lines: [], // { id, t, text, spk, marked, emb }
   names: {}, // speaker number -> custom name
   nextId: 1,
-  people: 0, // expected number of people in the room; 0 = detect automatically
+  people: 2, // people in the room (lawyer + client by default); 0 = detect automatically
 };
 const pending = new Map(); // segment id -> { t, marked }
 
@@ -167,8 +167,11 @@ function clusterSpeakers() {
     for (const x of alive) if (best[x] >= 0 && (a < 0 || sim[x][best[x]] > sim[a][best[a]])) a = x;
     if (a < 0) break;
     const b = best[a];
-    const tooMany = S.people > 0 && alive.size > S.people;
-    if (sim[a][b] < SAME_SPEAKER && !tooMany) break;
+    // With the number of people known, group to exactly that many once there
+    // is enough speech; no fixed cutoff separates similar voices (two women:
+    // different people up to 0.56 alike) while also not splitting others.
+    const exact = S.people > 0 && items.length >= 6;
+    if (exact ? alive.size <= S.people : sim[a][b] < SAME_SPEAKER && !(S.people > 0 && alive.size > S.people)) break;
     // Merge b into a; average linkage update.
     const na = groups[a].m.length, nb = groups[b].m.length;
     for (const k of alive) {
@@ -400,10 +403,12 @@ function mark() {
 
 function newMeeting() {
   if (S.lines.length && !confirm('Começar uma nova reunião? A transcrição atual será apagada desta tela. Baixe o .txt antes se quiser guardá-la.')) return;
-  Object.assign(S, { status: 'idle', title: 'Consulta com cliente', startedAt: null, samples: 0, lines: [], names: {} });
+  Object.assign(S, { status: 'idle', title: 'Consulta com cliente', startedAt: null, samples: 0, lines: [], names: {}, people: 2, peopleChosen: false });
+  el.people.value = '2';
   pending.clear();
   el.lines.innerHTML = '';
   lineEls.clear();
+  renderSpeakers();
   el.title.value = S.title;
   render();
   save();
@@ -452,7 +457,7 @@ const files = new Map();
 function startWorker() {
   if (worker) worker.terminate();
   files.clear();
-  worker = new Worker('worker.js?v=5', { type: 'module' });
+  worker = new Worker('worker.js?v=7', { type: 'module' });
   worker.onmessage = onWorker;
   worker.onerror = (e) => {
     console.error(e);
@@ -645,7 +650,7 @@ function renderCounts() {
 
 function renderStatus() {
   const labels = { idle: 'Pronto', rec: 'Ouvindo', paused: 'Pausado', stopped: 'Encerrado' };
-  const colors = { idle: '#5B616E', rec: '#C2362B', paused: '#8A4B00', stopped: '#1F3A5F' };
+  const colors = { idle: '#6B6355', rec: '#C2362B', paused: '#8A4B00', stopped: '#7D6224' };
   el.statusLabel.textContent = labels[S.status];
   el.statusLabel.style.color = colors[S.status];
   el.recDot.hidden = S.status !== 'rec';
@@ -687,7 +692,7 @@ function save() {
   saveT = setTimeout(() => {
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify({
-        title: S.title, startedAt: S.startedAt, samples: S.samples, lines: S.lines, people: S.people,
+        title: S.title, startedAt: S.startedAt, samples: S.samples, lines: S.lines, people: S.people, peopleChosen: S.peopleChosen,
         names: S.names, nextId: S.nextId, status: S.status,
       }));
     } catch (e) { console.warn('save failed', e); }
@@ -699,6 +704,8 @@ function restore() {
     const d = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
     if (!d) return;
     Object.assign(S, d);
+    // Older saves defaulted to auto-detect; only keep it if she picked it.
+    if (!d.peopleChosen) S.people = 2;
     // The microphone can't survive a page reload; continue as paused.
     if (S.status === 'rec') S.status = 'paused';
     if (S.status === 'idle' && S.lines.length) S.status = 'paused';
@@ -722,6 +729,7 @@ el.claude.onclick = () => copyText(CLAUDE_PROMPT + '\n' + asText(), 'Copiado. Ag
 el.title.addEventListener('input', () => { S.title = el.title.value; save(); });
 el.people.addEventListener('change', () => {
   S.people = Number(el.people.value);
+  S.peopleChosen = true;
   // Already more voices than people? Fold the closest ones together now.
   if (S.lines.length) {
     clusterSpeakers();
