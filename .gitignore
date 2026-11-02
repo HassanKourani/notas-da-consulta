@@ -2,3 +2,4 @@
 .DS_Store
 test/real*.wav
 test/mic48k.wav
+test/fast*.wav
