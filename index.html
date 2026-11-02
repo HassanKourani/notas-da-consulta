@@ -7,7 +7,7 @@
 <link rel="icon" href="assets/logo.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Marcellus&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css?v=7">
+<link rel="stylesheet" href="styles.css?v=14">
 </head>
 <body>
 <div class="page">
@@ -85,6 +85,10 @@
           <p class="empty-text">Coloque o aparelho sobre a mesa e toque em Começar a ouvir. A conversa aparece aqui conforme as pessoas falam.</p>
         </div>
         <div id="lines"></div>
+        <div id="preview" class="line preview" hidden aria-live="polite">
+          <span class="line-time"></span>
+          <div class="line-body"><span class="preview-label">Ouvindo…</span><p class="line-text"></p></div>
+        </div>
         <div id="listening" class="listening" hidden>
           <span class="eq" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
           <span id="listeningText">Ouvindo…</span>
@@ -119,7 +123,7 @@
           <select id="quality">
             <option value="auto">Automática</option>
             <option value="alta">Alta (mais precisa, download maior)</option>
-            <option value="leve">Leve (mais rápida)</option>
+            <option value="leve">Leve (download menor, sem placa de vídeo)</option>
           </select>
         </label>
       </section>
@@ -129,6 +133,6 @@
   </div>
 </div>
 <div id="toast" class="toast" role="status" hidden></div>
-<script type="module" src="app.js?v=7"></script>
+<script type="module" src="app.js?v=14"></script>
 </body>
 </html>

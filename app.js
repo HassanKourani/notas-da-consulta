@@ -71,7 +71,7 @@ const el = {
   listening: $('listening'), listeningText: $('listeningText'), pausedNote: $('pausedNote'),
   speakers: $('speakers'), noSpeakers: $('noSpeakers'),
   engineText: $('engineText'), progressWrap: $('progressWrap'), progressBar: $('progressBar'),
-  quality: $('quality'), toast: $('toast'), people: $('people'),
+  quality: $('quality'), toast: $('toast'), people: $('people'), preview: $('preview'),
 };
 
 // ---------- helpers ----------
@@ -162,16 +162,30 @@ function clusterSpeakers() {
   };
   for (const a of alive) findBest(a);
 
+  // Durations decide which groups are people: a group needs enough speech
+  // before it can take one of the N places, otherwise a few odd-sounding clips
+  // (a cough, a short "sim") form a "person" and the real two get merged.
+  const totalDur = items.reduce((s, l) => s + (l.d || 1), 0);
+  groups.forEach((g) => { g.dur = g.m.reduce((s, i) => s + (items[i].d || 1), 0); });
+  const isPerson = (g) => !!g.pin || (g.m.length >= 2 && g.dur >= Math.max(3, 0.05 * totalDur));
+  const people = () => { let c = 0; for (const g of alive) if (isPerson(groups[g])) c++; return c; };
+  const snapshot = () => [...alive].map((g) => ({ m: groups[g].m.slice(), pin: groups[g].pin, dur: groups[g].dur }));
+  // With the number of people known (and enough speech), use the grouping
+  // where exactly that many people stand out: no fixed cutoff separates similar
+  // voices (two women: different people up to 0.56 alike) without splitting others.
+  const exact = S.people > 0 && items.length >= 6;
+  let atCutoff = null, atCount = null;
+
   for (;;) {
     let a = -1;
     for (const x of alive) if (best[x] >= 0 && (a < 0 || sim[x][best[x]] > sim[a][best[a]])) a = x;
+    if (exact && people() === S.people) atCount = snapshot();
     if (a < 0) break;
     const b = best[a];
-    // With the number of people known, group to exactly that many once there
-    // is enough speech; no fixed cutoff separates similar voices (two women:
-    // different people up to 0.56 alike) while also not splitting others.
-    const exact = S.people > 0 && items.length >= 6;
-    if (exact ? alive.size <= S.people : sim[a][b] < SAME_SPEAKER && !(S.people > 0 && alive.size > S.people)) break;
+    if (!atCutoff && sim[a][b] < SAME_SPEAKER) {
+      atCutoff = snapshot();
+      if (!exact) break;
+    }
     // Merge b into a; average linkage update.
     const na = groups[a].m.length, nb = groups[b].m.length;
     for (const k of alive) {
@@ -179,15 +193,34 @@ function clusterSpeakers() {
       sim[a][k] = sim[k][a] = (na * sim[a][k] + nb * sim[b][k]) / (na + nb);
     }
     groups[a].m.push(...groups[b].m);
+    groups[a].dur += groups[b].dur;
     groups[a].pin = groups[a].pin || groups[b].pin;
     alive.delete(b);
     for (const k of alive) if (k === a || best[k] === a || best[k] === b || !canMerge(k, best[k])) findBest(k);
     for (const k of alive) if (k !== a && canMerge(k, a) && best[k] >= 0 && sim[k][a] > sim[k][best[k]]) best[k] = a;
   }
+  if (!atCutoff) atCutoff = snapshot();
+
+  let final = atCutoff;
+  if (atCount) {
+    // Fold stray clips into the person they sound most like.
+    final = atCount.filter(isPerson);
+    for (const g of atCount) {
+      if (isPerson(g)) continue;
+      let into = null, bestSim = -Infinity;
+      for (const f of final) {
+        if (g.pin && f.pin && g.pin !== f.pin) continue;
+        let s = 0;
+        for (const i of g.m) for (const j of f.m) s += dot(vecs[i], vecs[j]);
+        s /= g.m.length * f.m.length;
+        if (s > bestSim) { bestSim = s; into = f; }
+      }
+      if (into) into.m.push(...g.m); else final.push(g);
+    }
+  }
 
   // Name groups: joined speaker first, then whichever current label
   // most of the group already has, so numbers and renames stay put.
-  const final = [...alive].map((g) => groups[g]);
   const taken = new Set();
   const label = new Map();
   for (const g of final) if (g.pin) { label.set(g, g.pin); taken.add(g.pin); }
@@ -248,10 +281,18 @@ const seg = {
   preroll: [], noise: 0.01, marked: false,
 };
 const PREROLL = 10; // ~320 ms kept before speech starts
-const END_SILENCE = 22; // ~700 ms of quiet ends a sentence
-const SOFT_END_SILENCE = 8; // after 12 s, ~250 ms of quiet is enough
-const MAX_FRAMES = Math.round((20 * SR) / FRAME);
-const SOFT_FRAMES = Math.round((12 * SR) / FRAME);
+// A new line starts at any pause of ~0.3 s: most changes of speaker have at
+// least that much silence, and with 0.7 s quick replies shared a line with the
+// question (real voices, 0.1-0.5 s gaps: 9 of 16 lines held two people). Short
+// lines are cheap because the worker transcribes waiting lines in one pass.
+const END_SILENCE = 9; // ~290 ms of quiet ends a line...
+const SHORT_VOICE = 12; // ...but a line with under ~0.4 s of voice so far
+const SHORT_END_SILENCE = 15; // waits for ~480 ms, so soft speech isn't chopped into crumbs
+const MIN_VOICE = 6; // ~0.2 s of voice: enough for "sim" / "não"
+const SOFT_END_SILENCE = 8; // after 8 s, ~250 ms of quiet is enough
+const MAX_FRAMES = Math.round((12 * SR) / FRAME);
+const SOFT_FRAMES = Math.round((8 * SR) / FRAME);
+const PREVIEW_EVERY = Math.round((1.5 * SR) / FRAME); // live preview while someone talks
 let level = 0;
 
 function onFrame(frame) {
@@ -281,11 +322,40 @@ function onFrame(frame) {
     seg.frames.push(frame);
     if (speech) { seg.voiced++; seg.silence = 0; } else seg.silence++;
     const n = seg.frames.length;
-    if (seg.silence >= END_SILENCE || n >= MAX_FRAMES || (n >= SOFT_FRAMES && seg.silence >= SOFT_END_SILENCE)) {
+    const endAfter = seg.voiced < SHORT_VOICE ? SHORT_END_SILENCE : END_SILENCE;
+    if (seg.silence >= endAfter || n >= MAX_FRAMES || (n >= SOFT_FRAMES && seg.silence >= SOFT_END_SILENCE)) {
       flushSegment();
     }
   }
   S.samples += FRAME;
+  if (seg.active && engineReady && seg.frames.length >= PREVIEW_EVERY && seg.frames.length % PREVIEW_EVERY === 0) requestPreview();
+}
+
+// Ask the worker (only when it has nothing else to do) for a draft of the
+// sentence still being spoken, so text appears before the speaker pauses.
+function requestPreview() {
+  if (pending.size) return;
+  const audio = new Float32Array(seg.frames.length * FRAME);
+  seg.frames.forEach((f, i) => audio.set(f, i * FRAME));
+  worker.postMessage({ type: 'partial', id: S.nextId, audio }, [audio.buffer]);
+  preview.t = Math.max(0, seg.start / SR);
+}
+const preview = { id: 0, t: 0, text: '' };
+function showPreview(id, text) {
+  // Only for the sentence still being spoken or waiting for its final text.
+  if (!(pending.has(id) || (seg.active && id === S.nextId))) return;
+  preview.id = id;
+  preview.text = cleanText(text);
+  renderPreview();
+}
+function renderPreview() {
+  const show = !!preview.text && (pending.has(preview.id) || (seg.active && preview.id === S.nextId));
+  el.preview.hidden = !show;
+  if (!show) return;
+  el.preview.querySelector('.line-time').textContent = fmt(preview.t);
+  el.preview.querySelector('.line-text').textContent = preview.text + '…';
+  const nearBottom = el.list.scrollHeight - el.list.scrollTop - el.list.clientHeight < 120;
+  if (nearBottom) el.list.scrollTop = el.list.scrollHeight;
 }
 
 function flushSegment() {
@@ -296,11 +366,11 @@ function flushSegment() {
   const t = Math.max(0, seg.start / SR);
   const marked = seg.marked;
   seg.active = false; seg.frames = []; seg.voiced = 0; seg.silence = 0; seg.run = 0; seg.marked = false;
-  if (voiced < 10) return; // under ~0.3 s of actual voice: a cough or a click
+  if (voiced < MIN_VOICE) return; // a cough or a click
   const audio = new Float32Array(frames.length * FRAME);
   frames.forEach((f, i) => audio.set(f, i * FRAME));
   const id = S.nextId++;
-  pending.set(id, { t, marked, dur: audio.length / SR });
+  pending.set(id, { t, marked, dur: audio.length / SR, at: performance.now() });
   worker.postMessage({ type: 'segment', id, audio }, [audio.buffer]);
   renderStatus();
 }
@@ -419,9 +489,17 @@ function asText() {
   const out = [S.title, fmtDate(S.startedAt || Date.now()), 'Duração: ' + fmt(seconds())];
   if (spk.length) out.push('Participantes: ' + spk.join(', '));
   out.push('');
+  // One paragraph per turn: consecutive lines from the same person are joined.
+  let para = null;
   for (const l of S.lines) {
-    out.push(`[${fmt(l.t)}] ${speakerName(l.spk)}: ${l.text}${l.marked ? '  [MARCADO]' : ''}`);
+    if (para && para.spk === l.spk && !para.marked && !l.marked) {
+      para.text += ' ' + l.text;
+      continue;
+    }
+    if (para) out.push(`[${fmt(para.t)}] ${speakerName(para.spk)}: ${para.text}${para.marked ? '  [MARCADO]' : ''}`);
+    para = { t: l.t, spk: l.spk, text: l.text, marked: l.marked };
   }
+  if (para) out.push(`[${fmt(para.t)}] ${speakerName(para.spk)}: ${para.text}${para.marked ? '  [MARCADO]' : ''}`);
   return out.join('\n');
 }
 
@@ -457,7 +535,7 @@ const files = new Map();
 function startWorker() {
   if (worker) worker.terminate();
   files.clear();
-  worker = new Worker('worker.js?v=7', { type: 'module' });
+  worker = new Worker('worker.js?v=14', { type: 'module' });
   worker.onmessage = onWorker;
   worker.onerror = (e) => {
     console.error(e);
@@ -492,6 +570,8 @@ function onWorker(e) {
     renderStatus();
   } else if (m.type === 'error') {
     el.engineText.textContent = 'Erro ao carregar o reconhecimento de voz: ' + m.message;
+  } else if (m.type === 'partial') {
+    showPreview(m.id, m.text);
   } else if (m.type === 'result') {
     onResult(m);
   }
@@ -501,14 +581,28 @@ function onResult(m) {
   const p = pending.get(m.id);
   pending.delete(m.id);
   if (m.error) console.warn('segment failed', m.error);
-  const text = p ? cleanText(m.text) : '';
-  if (text) {
-    const line = { id: m.id, t: p.t, text, spk: maxSpeaker() + 1, d: p.dur, marked: p.marked, emb: m.emb ? m.emb.map((x) => Math.round(x * 1e4) / 1e4) : null };
+  // Debug: seconds from a line being cut to its text arriving.
+  if (window.__timings && m.ms) window.__timings.push({ dur: p ? p.dur : 0, pieces: m.pieces.length, wait: p ? (performance.now() - p.at) / 1000 : 0, ...m.ms });
+  // One recorded stretch can hold several speakers; the worker split it.
+  const lines = [];
+  for (const [k, piece] of (p ? m.pieces : []).entries()) {
+    const text = cleanText(piece.text);
+    if (!text) continue;
+    lines.push({
+      id: (S.lineSeq = (S.lineSeq || 100000) + 1),
+      t: p.t + piece.start, text, spk: maxSpeaker() + 1 + k, d: piece.end - piece.start,
+      marked: p.marked && k === 0,
+      emb: piece.emb ? piece.emb.map((x) => Math.round(x * 1e4) / 1e4) : null,
+    });
+  }
+  if (lines.length) {
     // Results arrive in order, but keep the transcript sorted by time anyway.
-    S.lines.push(line);
+    S.lines.push(...lines);
     S.lines.sort((a, b) => a.t - b.t);
-    // No voice print (rare): assume the previous speaker kept talking.
-    if (!line.emb) { const prev = S.lines[S.lines.indexOf(line) - 1]; line.spk = prev ? prev.spk : 1; }
+    for (const line of lines) {
+      // No voice print (rare): assume the previous speaker kept talking.
+      if (!line.emb) { const prev = S.lines[S.lines.indexOf(line) - 1]; line.spk = prev ? prev.spk : 1; }
+    }
     clusterSpeakers();
     renderAllLines();
     renderSpeakers();
@@ -516,6 +610,7 @@ function onResult(m) {
   }
   if (S.status === 'stopped' && pending.size === 0) finish();
   render();
+  renderPreview();
 }
 
 // ---------- rendering ----------
@@ -550,6 +645,9 @@ function renderLine(line) {
     if (nearBottom) el.list.scrollTop = el.list.scrollHeight;
   }
   node.classList.toggle('marked', !!line.marked);
+  // Same person still talking: don't repeat the name.
+  const prev = S.lines[S.lines.indexOf(line) - 1];
+  node.classList.toggle('cont', !!prev && prev.spk === line.spk && line.t - (prev.t + (prev.d || 0)) < 3);
   node.querySelector('.line-time').textContent = fmt(line.t);
   const spk = node.querySelector('.spk');
   spk.textContent = speakerName(line.spk);
@@ -693,7 +791,7 @@ function save() {
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify({
         title: S.title, startedAt: S.startedAt, samples: S.samples, lines: S.lines, people: S.people, peopleChosen: S.peopleChosen,
-        names: S.names, nextId: S.nextId, status: S.status,
+        names: S.names, nextId: S.nextId, lineSeq: S.lineSeq, status: S.status,
       }));
     } catch (e) { console.warn('save failed', e); }
   }, 300);
@@ -759,6 +857,7 @@ startWorker();
 if (new URLSearchParams(location.search).has('debug')) {
   window.__S = S;
   window.__cluster = clusterSpeakers;
+  window.__timings = [];
   window.__feed = async (url) => {
     const buf = await (await fetch(url)).arrayBuffer();
     const decoded = await new AudioContext().decodeAudioData(buf);
@@ -775,7 +874,7 @@ if (new URLSearchParams(location.search).has('debug')) {
     stop();
   };
   // Same, but through audio-processor.js at a laptop mic's 48 kHz, like a live meeting.
-  window.__feedMic = async (url, rate = 48000) => {
+  window.__feedMic = async (url, rate = 48000, realtime = false) => {
     const buf = await (await fetch(url)).arrayBuffer();
     const off = new OfflineAudioContext(1, 1, rate);
     const decoded = await off.decodeAudioData(buf);
@@ -793,7 +892,15 @@ if (new URLSearchParams(location.search).has('debug')) {
     if (!S.startedAt) S.startedAt = Date.now();
     S.status = 'rec';
     render();
-    for (const f of frames) onFrame(f);
+    const t0 = performance.now();
+    for (let i = 0; i < frames.length; i++) {
+      // Realtime: hand frames over at speaking speed, like a live microphone.
+      if (realtime && i % 16 === 0) {
+        const due = t0 + (i * FRAME * 1000) / SR;
+        if (due > performance.now()) await new Promise((r) => setTimeout(r, due - performance.now()));
+      }
+      onFrame(frames[i]);
+    }
     stop();
   };
 }
