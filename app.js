@@ -1,25 +1,15 @@
-// Notas da Consulta — live meeting transcription that runs entirely in the browser.
-// Flow: microphone -> audio-processor.js (16 kHz frames) -> voice-activity
-// segmenter (here) -> worker.js (Whisper text + speaker fingerprint) ->
-// speaker clustering (here) -> transcript.
+// Notas da Consulta — live meeting transcription with the browser's own speech
+// recognition (Web Speech API), so there is nothing to download. The browser
+// sends the audio to its speech service (Google in Chrome, Microsoft in Edge,
+// Apple in Safari) and gets text back. Only the text is kept, in this browser.
 
-const SR = 16000;
-const FRAME = 512;
 const STORE_KEY = 'notas-consulta:v1';
-const QUALITY_KEY = 'notas-consulta:quality';
-
-// Voice prints (cosine) of two groups of sentences at least this alike are the
-// same person. Real Portuguese speakers through a 48 kHz mic path: 0.15-0.20
-// separated 2, 3 and 4 speakers with no errors; 0.25+ starts splitting people,
-// 0.10 merges them. See README "Tested".
-const SAME_SPEAKER = 0.18;
-const SPEAKER_COLORS = ['#7D6224', '#0F6B5C', '#2B4A7A', '#8A3B5A', '#5A4A8A', '#3F6B1F', '#6B6355'];
 
 const CLAUDE_PROMPT = `Você é assistente de uma advogada brasileira. Abaixo está a transcrição automática de uma reunião presencial com cliente(s).
 
 Atenção:
-- A transcrição foi feita por reconhecimento de voz e pode conter erros de palavras.
-- Os participantes aparecem como "Falante 1", "Falante 2" etc. (ou pelo nome, se a advogada os renomeou). A separação entre falantes é automática e pode ter erros. Pelo conteúdo, indique quem provavelmente é a advogada e quem é o cliente.
+- A transcrição foi feita por reconhecimento de voz e pode conter erros de palavras e pouca pontuação.
+- A transcrição não identifica quem fala. Pelo conteúdo, indique quando possível o que foi dito pela advogada e o que foi dito pelo cliente.
 - Trechos com [MARCADO] foram destacados pela advogada como importantes durante a reunião.
 - Não invente fatos, datas ou valores que não estejam na transcrição. Se algo estiver ambíguo, diga que está ambíguo.
 
@@ -34,31 +24,16 @@ Com base na transcrição, escreva em português do Brasil:
 TRANSCRIÇÃO
 `;
 
-// Whisper's well-known "phantom" outputs on silence or noise in Portuguese.
-const JUNK = [
-  /amara\.org/i,
-  /legendas?\s+(pela|por|da|em)/i,
-  /legendado\s+por/i,
-  /obrigad[oa]s?\s+por\s+assistir/i,
-  /inscreva-se/i,
-  /se\s+inscreva/i,
-  /deixe\s+(seu|o\s+seu)\s+like/i,
-  /^[\s\p{P}]*$/u,
-  /^(música|\[música\]|\(música\)|♪+)$/i,
-];
-
 // ---------- state ----------
 const S = {
   status: 'idle', // idle | rec | paused | stopped
   title: 'Consulta com cliente',
   startedAt: null,
-  samples: 0, // meeting audio samples captured, drives the clock and timestamps
-  lines: [], // { id, t, text, spk, marked, emb }
-  names: {}, // speaker number -> custom name
+  elapsed: 0, // ms spent recording (pauses excluded), drives the clock and line times
+  lines: [], // { id, t, text, marked }
   nextId: 1,
-  people: 2, // people in the room (lawyer + client by default); 0 = detect automatically
 };
-const pending = new Map(); // segment id -> { t, marked }
+let resumedAt = 0; // when the current recording stretch began (Date.now())
 
 // ---------- dom ----------
 const $ = (id) => document.getElementById(id);
@@ -68,10 +43,8 @@ const el = {
   start: $('btnStart'), pause: $('btnPause'), mark: $('btnMark'), resume: $('btnResume'),
   stop: $('btnStop'), newMeeting: $('btnNew'), copy: $('btnCopy'), download: $('btnDownload'),
   claude: $('btnClaude'), counts: $('counts'), list: $('list'), empty: $('empty'), lines: $('lines'),
-  listening: $('listening'), listeningText: $('listeningText'), pausedNote: $('pausedNote'),
-  speakers: $('speakers'), noSpeakers: $('noSpeakers'),
-  engineText: $('engineText'), progressWrap: $('progressWrap'), progressBar: $('progressBar'),
-  quality: $('quality'), toast: $('toast'), people: $('people'), preview: $('preview'),
+  listening: $('listening'), pausedNote: $('pausedNote'), engineText: $('engineText'),
+  toast: $('toast'), preview: $('preview'),
 };
 
 // ---------- helpers ----------
@@ -82,26 +55,7 @@ const fmt = (s) => {
   return (h ? h + ':' : '') + p(m) + ':' + p(x);
 };
 const fmtDate = (d) => new Date(d).toLocaleDateString('pt-BR', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
-const speakerName = (n) => S.names[n] || `Falante ${n}`;
-const speakerColor = (n) => SPEAKER_COLORS[(n - 1) % SPEAKER_COLORS.length];
-const seconds = () => S.samples / SR;
-
-function normalize(v) {
-  let s = 0;
-  for (const x of v) s += x * x;
-  s = Math.sqrt(s) || 1;
-  return v.map((x) => x / s);
-}
-function dot(a, b) {
-  let d = 0;
-  for (let i = 0; i < a.length; i++) d += a[i] * b[i];
-  return d;
-}
-function cosine(a, b) {
-  let d = 0, na = 0, nb = 0;
-  for (let i = 0; i < a.length; i++) { d += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
-  return d / (Math.sqrt(na * nb) || 1);
-}
+const seconds = () => (S.elapsed + (resumedAt ? Date.now() - resumedAt : 0)) / 1000;
 
 let toastT;
 function flash(msg) {
@@ -111,293 +65,110 @@ function flash(msg) {
   toastT = setTimeout(() => { el.toast.hidden = true; }, 2200);
 }
 
+// Chrome returns lowercase phrases with little punctuation.
 function cleanText(t) {
   t = t.replace(/\s+/g, ' ').trim();
-  // Collapse Whisper repetition loops ("sim, sim, sim, sim, sim...").
-  t = t.replace(/(\b.{2,40}?)(?:[\s,.]*\1){3,}/gi, '$1');
-  if (JUNK.some((r) => r.test(t))) return '';
-  return t;
+  return t.charAt(0).toLocaleUpperCase('pt-BR') + t.slice(1);
 }
 
-// ---------- speakers ----------
-// Who said what is decided by grouping every voice print heard so far
-// (average-linkage agglomerative clustering), re-run as each sentence arrives.
-// Deciding one sentence at a time failed on real voices: short clips give noisy
-// prints (same person 0.12-0.9, different people up to 0.23), so early guesses
-// locked people into the wrong speaker. User fixes are respected:
-// - a single line moved by hand ("manual") is left out and keeps its speaker;
-// - speakers joined with "Juntar com…" ("anchor") start as one group that
-//   new sentences can still join, and never merges with another anchor.
-function clusterSpeakers() {
-  const items = S.lines.filter((l) => l.emb && !l.manual);
-  if (!items.length) return false;
-  const vecs = items.map((l) => normalize(l.emb));
+// ---------- speech recognition ----------
+let Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+// Whose service turns the audio into text, for the privacy notice.
+const ua = navigator.userAgent;
+const SERVICE = /Edg\//.test(ua) ? { to: 'à Microsoft', of: 'da Microsoft' }
+  : /Chrome\//.test(ua) ? { to: 'ao Google', of: 'do Google' }
+  : /Safari\//.test(ua) ? { to: 'à Apple', of: 'da Apple' }
+  : { to: 'ao serviço de voz do navegador', of: 'do navegador' };
+const MAX_FAILURES = 5; // sessions in a row ending in an error before giving up
 
-  // Start with one group per joined speaker plus one per other sentence.
-  const groups = [];
-  const pinned = new Map();
-  items.forEach((l, i) => {
-    if (l.anchor) {
-      if (!pinned.has(l.anchor)) { pinned.set(l.anchor, groups.length); groups.push({ m: [], pin: l.anchor }); }
-      groups[pinned.get(l.anchor)].m.push(i);
-    } else groups.push({ m: [i], pin: 0 });
-  });
+let rec = null;
+let failures = 0;
+let speechError = '';
+let engineNote = ''; // why recognition stopped, shown in the speech card
+let markNext = false; // Marcar pressed while a phrase was still being spoken
+const draft = { t: null, text: '' }; // words heard but not final yet
 
-  // Pairwise group similarity (average of member similarities).
-  const n = groups.length;
-  const sim = Array.from({ length: n }, () => new Float64Array(n));
-  for (let a = 0; a < n; a++) {
-    for (let b = a + 1; b < n; b++) {
-      let s = 0;
-      for (const i of groups[a].m) for (const j of groups[b].m) s += dot(vecs[i], vecs[j]);
-      sim[a][b] = sim[b][a] = s / (groups[a].m.length * groups[b].m.length);
+// Browsers end a recognition session on their own (after a silence, a network
+// hiccup or a few minutes), so while recording a new one starts right away.
+function listen() {
+  const r = new Recognition();
+  r.lang = 'pt-BR';
+  r.continuous = true;
+  r.interimResults = true;
+  r.onresult = onSpeech;
+  r.onerror = (e) => { speechError = e.error; };
+  r.onend = () => onSpeechEnd(r);
+  rec = r;
+  try { r.start(); } catch (e) { console.warn(e); }
+}
+
+function onSpeech(e) {
+  failures = 0;
+  let interim = '';
+  for (let i = e.resultIndex; i < e.results.length; i++) {
+    const r = e.results[i];
+    if (r.isFinal) {
+      // The line's time is when its first words appeared, not when it ended.
+      addLine(draft.t ?? seconds(), r[0].transcript);
+      draft.t = null;
+    } else {
+      interim += r[0].transcript;
     }
   }
-  const alive = new Set(groups.keys());
-  const canMerge = (a, b) => !(groups[a].pin && groups[b].pin && groups[a].pin !== groups[b].pin);
-  const best = new Int32Array(n).fill(-1);
-  const findBest = (a) => {
-    best[a] = -1;
-    for (const b of alive) if (b !== a && canMerge(a, b) && (best[a] < 0 || sim[a][b] > sim[a][best[a]])) best[a] = b;
-  };
-  for (const a of alive) findBest(a);
-
-  // Durations decide which groups are people: a group needs enough speech
-  // before it can take one of the N places, otherwise a few odd-sounding clips
-  // (a cough, a short "sim") form a "person" and the real two get merged.
-  const totalDur = items.reduce((s, l) => s + (l.d || 1), 0);
-  groups.forEach((g) => { g.dur = g.m.reduce((s, i) => s + (items[i].d || 1), 0); });
-  const isPerson = (g) => !!g.pin || (g.m.length >= 2 && g.dur >= Math.max(3, 0.05 * totalDur));
-  const people = () => { let c = 0; for (const g of alive) if (isPerson(groups[g])) c++; return c; };
-  const snapshot = () => [...alive].map((g) => ({ m: groups[g].m.slice(), pin: groups[g].pin, dur: groups[g].dur }));
-  // With the number of people known (and enough speech), use the grouping
-  // where exactly that many people stand out: no fixed cutoff separates similar
-  // voices (two women: different people up to 0.56 alike) without splitting others.
-  const exact = S.people > 0 && items.length >= 6;
-  let atCutoff = null, atCount = null;
-
-  for (;;) {
-    let a = -1;
-    for (const x of alive) if (best[x] >= 0 && (a < 0 || sim[x][best[x]] > sim[a][best[a]])) a = x;
-    if (exact && people() === S.people) atCount = snapshot();
-    if (a < 0) break;
-    const b = best[a];
-    if (!atCutoff && sim[a][b] < SAME_SPEAKER) {
-      atCutoff = snapshot();
-      if (!exact) break;
-    }
-    // Merge b into a; average linkage update.
-    const na = groups[a].m.length, nb = groups[b].m.length;
-    for (const k of alive) {
-      if (k === a || k === b) continue;
-      sim[a][k] = sim[k][a] = (na * sim[a][k] + nb * sim[b][k]) / (na + nb);
-    }
-    groups[a].m.push(...groups[b].m);
-    groups[a].dur += groups[b].dur;
-    groups[a].pin = groups[a].pin || groups[b].pin;
-    alive.delete(b);
-    for (const k of alive) if (k === a || best[k] === a || best[k] === b || !canMerge(k, best[k])) findBest(k);
-    for (const k of alive) if (k !== a && canMerge(k, a) && best[k] >= 0 && sim[k][a] > sim[k][best[k]]) best[k] = a;
-  }
-  if (!atCutoff) atCutoff = snapshot();
-
-  let final = atCutoff;
-  if (atCount) {
-    // Fold stray clips into the person they sound most like.
-    final = atCount.filter(isPerson);
-    for (const g of atCount) {
-      if (isPerson(g)) continue;
-      let into = null, bestSim = -Infinity;
-      for (const f of final) {
-        if (g.pin && f.pin && g.pin !== f.pin) continue;
-        let s = 0;
-        for (const i of g.m) for (const j of f.m) s += dot(vecs[i], vecs[j]);
-        s /= g.m.length * f.m.length;
-        if (s > bestSim) { bestSim = s; into = f; }
-      }
-      if (into) into.m.push(...g.m); else final.push(g);
-    }
-  }
-
-  // Name groups: joined speaker first, then whichever current label
-  // most of the group already has, so numbers and renames stay put.
-  const taken = new Set();
-  const label = new Map();
-  for (const g of final) if (g.pin) { label.set(g, g.pin); taken.add(g.pin); }
-  const votes = [];
-  for (const g of final) {
-    if (g.pin) continue;
-    const c = new Map();
-    for (const i of g.m) c.set(items[i].spk, (c.get(items[i].spk) || 0) + 1);
-    for (const [spk, k] of c) votes.push({ g, spk, k });
-  }
-  votes.sort((x, y) => y.k - x.k);
-  for (const v of votes) if (!label.has(v.g) && !taken.has(v.spk)) { label.set(v.g, v.spk); taken.add(v.spk); }
-  // Brand-new groups skip numbers hand-moved lines already use.
-  const handLabels = new Set(S.lines.filter((l) => l.manual).map((l) => l.spk));
-  let next = 1;
-  for (const g of final) {
-    if (label.has(g)) continue;
-    while (taken.has(next) || handLabels.has(next)) next++;
-    label.set(g, next); taken.add(next);
-  }
-  let changed = false;
-  for (const g of final) {
-    const spk = label.get(g);
-    for (const i of g.m) if (items[i].spk !== spk) { items[i].spk = spk; changed = true; }
-  }
-  return changed;
-}
-
-function mergeSpeaker(from, into) {
-  for (const l of S.lines) {
-    if (l.spk === from) l.spk = into;
-    if (l.spk === into && !l.manual) l.anchor = into; // the user said these are one person
-  }
-  if (!S.names[into] && S.names[from]) S.names[into] = S.names[from];
-  delete S.names[from];
-}
-
-function maxSpeaker() {
-  return S.lines.reduce((m, l) => Math.max(m, l.spk), 0);
-}
-
-// Make speakers 1..k in order of first appearance, carrying names along.
-function renumberSpeakers() {
-  const map = new Map();
-  for (const l of S.lines) if (!map.has(l.spk)) map.set(l.spk, map.size + 1);
-  const names = {};
-  for (const [oldN, newN] of map) if (S.names[oldN]) names[newN] = S.names[oldN];
-  for (const l of S.lines) {
-    l.spk = map.get(l.spk);
-    if (l.anchor) l.anchor = l.spk;
-  }
-  S.names = names;
-}
-
-// ---------- segmenter (voice activity detection) ----------
-const seg = {
-  active: false, frames: [], voiced: 0, silence: 0, run: 0, start: 0,
-  preroll: [], noise: 0.01, marked: false,
-};
-const PREROLL = 10; // ~320 ms kept before speech starts
-// A new line starts at any pause of ~0.3 s: most changes of speaker have at
-// least that much silence, and with 0.7 s quick replies shared a line with the
-// question (real voices, 0.1-0.5 s gaps: 9 of 16 lines held two people). Short
-// lines are cheap because the worker transcribes waiting lines in one pass.
-const END_SILENCE = 9; // ~290 ms of quiet ends a line...
-const SHORT_VOICE = 12; // ...but a line with under ~0.4 s of voice so far
-const SHORT_END_SILENCE = 15; // waits for ~480 ms, so soft speech isn't chopped into crumbs
-const MIN_VOICE = 6; // ~0.2 s of voice: enough for "sim" / "não"
-const SOFT_END_SILENCE = 8; // after 8 s, ~250 ms of quiet is enough
-const MAX_FRAMES = Math.round((12 * SR) / FRAME);
-const SOFT_FRAMES = Math.round((8 * SR) / FRAME);
-const PREVIEW_EVERY = Math.round((1.5 * SR) / FRAME); // live preview while someone talks
-let level = 0;
-
-function onFrame(frame) {
-  if (S.status !== 'rec') return;
-  let sum = 0;
-  for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
-  const rms = Math.sqrt(sum / frame.length);
-  level = level * 0.8 + rms * 0.2;
-
-  const threshold = Math.max(seg.noise * 3, 0.006);
-  const speech = rms > threshold;
-  if (!seg.active) {
-    // Track the room's background level while nobody is talking.
-    seg.noise = rms < seg.noise ? seg.noise * 0.9 + rms * 0.1 : seg.noise * 0.995 + rms * 0.005;
-    seg.preroll.push(frame);
-    if (seg.preroll.length > PREROLL) seg.preroll.shift();
-    seg.run = speech ? seg.run + 1 : 0;
-    if (seg.run >= 3) {
-      seg.active = true;
-      seg.frames = seg.preroll.slice();
-      seg.start = S.samples - (seg.frames.length - 1) * FRAME;
-      seg.voiced = seg.run;
-      seg.silence = 0;
-      seg.preroll = [];
-    }
-  } else {
-    seg.frames.push(frame);
-    if (speech) { seg.voiced++; seg.silence = 0; } else seg.silence++;
-    const n = seg.frames.length;
-    const endAfter = seg.voiced < SHORT_VOICE ? SHORT_END_SILENCE : END_SILENCE;
-    if (seg.silence >= endAfter || n >= MAX_FRAMES || (n >= SOFT_FRAMES && seg.silence >= SOFT_END_SILENCE)) {
-      flushSegment();
-    }
-  }
-  S.samples += FRAME;
-  if (seg.active && engineReady && seg.frames.length >= PREVIEW_EVERY && seg.frames.length % PREVIEW_EVERY === 0) requestPreview();
-}
-
-// Ask the worker (only when it has nothing else to do) for a draft of the
-// sentence still being spoken, so text appears before the speaker pauses.
-function requestPreview() {
-  if (pending.size) return;
-  const audio = new Float32Array(seg.frames.length * FRAME);
-  seg.frames.forEach((f, i) => audio.set(f, i * FRAME));
-  worker.postMessage({ type: 'partial', id: S.nextId, audio }, [audio.buffer]);
-  preview.t = Math.max(0, seg.start / SR);
-}
-const preview = { id: 0, t: 0, text: '' };
-function showPreview(id, text) {
-  // Only for the sentence still being spoken or waiting for its final text.
-  if (!(pending.has(id) || (seg.active && id === S.nextId))) return;
-  preview.id = id;
-  preview.text = cleanText(text);
+  draft.text = cleanText(interim);
+  if (!draft.text) draft.t = null;
+  else if (draft.t === null) draft.t = seconds();
   renderPreview();
 }
-function renderPreview() {
-  const show = !!preview.text && (pending.has(preview.id) || (seg.active && preview.id === S.nextId));
-  el.preview.hidden = !show;
-  if (!show) return;
-  el.preview.querySelector('.line-time').textContent = fmt(preview.t);
-  el.preview.querySelector('.line-text').textContent = preview.text + '…';
-  const nearBottom = el.list.scrollHeight - el.list.scrollTop - el.list.clientHeight < 120;
-  if (nearBottom) el.list.scrollTop = el.list.scrollHeight;
+
+function onSpeechEnd(r) {
+  if (r !== rec) return;
+  rec = null;
+  // Words still on screen when a session ends are kept, not lost.
+  if (draft.text) addLine(draft.t ?? seconds(), draft.text);
+  draft.text = '';
+  draft.t = null;
+  renderPreview();
+  const err = speechError;
+  speechError = '';
+  if (S.status !== 'rec') return;
+  if (err === 'not-allowed' || err === 'service-not-allowed') return halt('mic');
+  if (err === 'audio-capture') return halt('nomic');
+  if (err === 'language-not-supported') return halt('language');
+  if (err && err !== 'no-speech' && err !== 'aborted') failures++;
+  if (failures >= MAX_FAILURES) return halt('network');
+  setTimeout(() => { if (S.status === 'rec' && !rec) listen(); }, failures * 1000);
 }
 
-function flushSegment() {
-  if (!seg.active) return;
-  const keepTail = Math.max(0, seg.silence - 6); // leave ~200 ms of trailing quiet
-  const frames = seg.frames.slice(0, seg.frames.length - keepTail);
-  const voiced = seg.voiced;
-  const t = Math.max(0, seg.start / SR);
-  const marked = seg.marked;
-  seg.active = false; seg.frames = []; seg.voiced = 0; seg.silence = 0; seg.run = 0; seg.marked = false;
-  if (voiced < MIN_VOICE) return; // a cough or a click
-  const audio = new Float32Array(frames.length * FRAME);
-  frames.forEach((f, i) => audio.set(f, i * FRAME));
-  const id = S.nextId++;
-  pending.set(id, { t, marked, dur: audio.length / SR, at: performance.now() });
-  worker.postMessage({ type: 'segment', id, audio }, [audio.buffer]);
-  renderStatus();
+// Recognition can't go on: stop recording and say why in the speech card.
+function halt(reason) {
+  engineNote = {
+    mic: 'O navegador não liberou o microfone. Clique no cadeado ao lado do endereço, permita o microfone e tente de novo.',
+    nomic: 'Nenhum microfone encontrado. Conecte um microfone e tente de novo.',
+    language: 'Este navegador não reconhece português do Brasil. Use o Google Chrome.',
+    network: `Sem resposta do serviço de voz ${SERVICE.of}. Verifique a internet e toque em Retomar. Se continuar, use o Google Chrome.`,
+  }[reason];
+  foldTime();
+  S.status = S.lines.length ? 'paused' : 'idle';
+  if (S.status === 'idle') { S.startedAt = null; S.elapsed = 0; }
+  keepAwake(false);
+  flash(reason === 'network' ? 'Reconhecimento de voz interrompido' : 'Não foi possível ouvir');
+  render();
+  save();
 }
 
-// ---------- microphone ----------
-let audioCtx = null, stream = null, wakeLock = null;
-
-async function startMic() {
-  stream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-  });
-  audioCtx = new AudioContext();
-  await audioCtx.audioWorklet.addModule('audio-processor.js');
-  const src = audioCtx.createMediaStreamSource(stream);
-  const node = new AudioWorkletNode(audioCtx, 'downsampler');
-  node.port.onmessage = (e) => onFrame(e.data);
-  const mute = audioCtx.createGain();
-  mute.gain.value = 0;
-  src.connect(node).connect(mute).connect(audioCtx.destination);
+function addLine(t, text) {
+  text = cleanText(text);
+  if (!text) return;
+  const line = { id: S.nextId++, t: Math.round(t * 10) / 10, text, marked: markNext };
+  markNext = false;
+  S.lines.push(line);
+  renderLine(line);
+  render();
+  save();
 }
 
-function stopMic() {
-  if (stream) stream.getTracks().forEach((t) => t.stop());
-  if (audioCtx) audioCtx.close();
-  stream = null; audioCtx = null;
-}
-
+let wakeLock = null;
 async function keepAwake(on) {
   try {
     if (on && 'wakeLock' in navigator && !wakeLock) {
@@ -411,58 +182,42 @@ async function keepAwake(on) {
 }
 
 // ---------- actions ----------
-async function start() {
-  try {
-    if (!audioCtx) await startMic();
-    else await audioCtx.resume();
-  } catch (e) {
-    console.error(e);
-    flash('Não foi possível acessar o microfone. Permita o acesso no navegador.');
-    return;
-  }
+function foldTime() {
+  if (resumedAt) S.elapsed += Date.now() - resumedAt;
+  resumedAt = 0;
+}
+
+function start() {
+  if (!Recognition) return;
   if (!S.startedAt) S.startedAt = Date.now();
   S.status = 'rec';
+  resumedAt = Date.now();
+  failures = 0;
+  engineNote = '';
+  // A session still finishing after Pausar restarts by itself when it ends.
+  if (!rec) listen();
   keepAwake(true);
   render();
   save();
 }
 
-async function pause() {
-  flushSegment();
-  S.status = 'paused';
-  if (audioCtx) await audioCtx.suspend();
+// Pausar / Encerrar: the phrase being spoken is finished and still added.
+function endRecording(status) {
+  foldTime();
+  S.status = status;
+  if (rec) rec.stop();
   keepAwake(false);
   render();
-  save();
-}
-
-function stop() {
-  flushSegment();
-  S.status = 'stopped';
-  stopMic();
-  keepAwake(false);
-  if (pending.size === 0) finish();
-  render();
-  save();
-}
-
-function finish() {
-  clusterSpeakers();
-  renumberSpeakers();
-  renderAllLines();
-  renderSpeakers();
   save();
 }
 
 function mark() {
-  if (seg.active) {
-    seg.marked = true;
+  if (draft.text) {
+    markNext = true;
     flash('Momento marcado');
     return;
   }
   const last = S.lines[S.lines.length - 1];
-  const inFlight = [...pending.values()].pop();
-  if (inFlight) { inFlight.marked = true; flash('Momento marcado'); return; }
   if (!last) { flash('Nada para marcar ainda'); return; }
   last.marked = true;
   renderLine(last);
@@ -473,33 +228,21 @@ function mark() {
 
 function newMeeting() {
   if (S.lines.length && !confirm('Começar uma nova reunião? A transcrição atual será apagada desta tela. Baixe o .txt antes se quiser guardá-la.')) return;
-  Object.assign(S, { status: 'idle', title: 'Consulta com cliente', startedAt: null, samples: 0, lines: [], names: {}, people: 2, peopleChosen: false });
-  el.people.value = '2';
-  pending.clear();
+  Object.assign(S, { status: 'idle', title: 'Consulta com cliente', startedAt: null, elapsed: 0, lines: [], nextId: 1 });
+  draft.text = '';
+  draft.t = null;
+  markNext = false;
   el.lines.innerHTML = '';
   lineEls.clear();
-  renderSpeakers();
   el.title.value = S.title;
   render();
+  renderPreview();
   save();
 }
 
 function asText() {
-  const spk = [...new Set(S.lines.map((l) => l.spk))].map(speakerName);
-  const out = [S.title, fmtDate(S.startedAt || Date.now()), 'Duração: ' + fmt(seconds())];
-  if (spk.length) out.push('Participantes: ' + spk.join(', '));
-  out.push('');
-  // One paragraph per turn: consecutive lines from the same person are joined.
-  let para = null;
-  for (const l of S.lines) {
-    if (para && para.spk === l.spk && !para.marked && !l.marked) {
-      para.text += ' ' + l.text;
-      continue;
-    }
-    if (para) out.push(`[${fmt(para.t)}] ${speakerName(para.spk)}: ${para.text}${para.marked ? '  [MARCADO]' : ''}`);
-    para = { t: l.t, spk: l.spk, text: l.text, marked: l.marked };
-  }
-  if (para) out.push(`[${fmt(para.t)}] ${speakerName(para.spk)}: ${para.text}${para.marked ? '  [MARCADO]' : ''}`);
+  const out = [S.title, fmtDate(S.startedAt || Date.now()), 'Duração: ' + fmt(seconds()), ''];
+  for (const l of S.lines) out.push(`[${fmt(l.t)}] ${l.text}${l.marked ? '  [MARCADO]' : ''}`);
   return out.join('\n');
 }
 
@@ -528,91 +271,6 @@ function download() {
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
-// ---------- worker ----------
-let worker;
-const files = new Map();
-
-function startWorker() {
-  if (worker) worker.terminate();
-  files.clear();
-  worker = new Worker('worker.js?v=14', { type: 'module' });
-  worker.onmessage = onWorker;
-  worker.onerror = (e) => {
-    console.error(e);
-    el.engineText.textContent = 'Erro ao carregar o reconhecimento de voz. Recarregue a página.';
-  };
-  el.engineText.textContent = 'Preparando…';
-  el.progressWrap.hidden = true;
-  engineReady = false;
-  worker.postMessage({ type: 'load', quality: el.quality.value });
-}
-let engineReady = false;
-let engineDesc = '';
-
-function onWorker(e) {
-  const m = e.data;
-  if (m.type === 'loading') {
-    const size = m.quality === 'alta' ? '~600 MB' : '~300 MB';
-    engineDesc = `${m.quality === 'alta' ? 'Alta' : 'Leve'} · ${m.device === 'webgpu' ? 'placa de vídeo' : 'processador'}`;
-    el.engineText.textContent = m.cached
-      ? 'Carregando o modelo de voz salvo neste computador…'
-      : `Baixando o modelo de voz (${size}, só na primeira vez)…`;
-  } else if (m.type === 'progress') {
-    files.set(m.file, m);
-    let loaded = 0, total = 0;
-    for (const f of files.values()) { loaded += f.loaded; total += f.total; }
-    el.progressWrap.hidden = false;
-    el.progressBar.style.width = `${Math.round((loaded / total) * 100)}%`;
-  } else if (m.type === 'ready') {
-    engineReady = true;
-    el.progressWrap.hidden = true;
-    el.engineText.textContent = `Pronto · ${engineDesc}. Tudo é processado neste computador.`;
-    renderStatus();
-  } else if (m.type === 'error') {
-    el.engineText.textContent = 'Erro ao carregar o reconhecimento de voz: ' + m.message;
-  } else if (m.type === 'partial') {
-    showPreview(m.id, m.text);
-  } else if (m.type === 'result') {
-    onResult(m);
-  }
-}
-
-function onResult(m) {
-  const p = pending.get(m.id);
-  pending.delete(m.id);
-  if (m.error) console.warn('segment failed', m.error);
-  // Debug: seconds from a line being cut to its text arriving.
-  if (window.__timings && m.ms) window.__timings.push({ dur: p ? p.dur : 0, pieces: m.pieces.length, wait: p ? (performance.now() - p.at) / 1000 : 0, ...m.ms });
-  // One recorded stretch can hold several speakers; the worker split it.
-  const lines = [];
-  for (const [k, piece] of (p ? m.pieces : []).entries()) {
-    const text = cleanText(piece.text);
-    if (!text) continue;
-    lines.push({
-      id: (S.lineSeq = (S.lineSeq || 100000) + 1),
-      t: p.t + piece.start, text, spk: maxSpeaker() + 1 + k, d: piece.end - piece.start,
-      marked: p.marked && k === 0,
-      emb: piece.emb ? piece.emb.map((x) => Math.round(x * 1e4) / 1e4) : null,
-    });
-  }
-  if (lines.length) {
-    // Results arrive in order, but keep the transcript sorted by time anyway.
-    S.lines.push(...lines);
-    S.lines.sort((a, b) => a.t - b.t);
-    for (const line of lines) {
-      // No voice print (rare): assume the previous speaker kept talking.
-      if (!line.emb) { const prev = S.lines[S.lines.indexOf(line) - 1]; line.spk = prev ? prev.spk : 1; }
-    }
-    clusterSpeakers();
-    renderAllLines();
-    renderSpeakers();
-    save();
-  }
-  if (S.status === 'stopped' && pending.size === 0) finish();
-  render();
-  renderPreview();
-}
-
 // ---------- rendering ----------
 const lineEls = new Map();
 
@@ -624,11 +282,10 @@ function renderLine(line) {
     node.innerHTML = `
       <button class="line-time" title="Marcar / desmarcar"></button>
       <div class="line-body">
-        <div class="line-head"><button class="spk" title="Trocar falante desta fala"></button><span class="badge" hidden>Marcado</span></div>
+        <span class="badge" hidden>Marcado</span>
         <p class="line-text" contenteditable="plaintext-only" spellcheck="false" title="Clique para corrigir o texto"></p>
       </div>`;
     node.querySelector('.line-time').onclick = () => { line.marked = !line.marked; renderLine(line); renderCounts(); save(); };
-    node.querySelector('.spk').onclick = (ev) => pickSpeaker(line, ev.currentTarget);
     const p = node.querySelector('.line-text');
     p.addEventListener('blur', () => {
       const t = p.textContent.trim();
@@ -637,113 +294,35 @@ function renderLine(line) {
     });
     p.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); p.blur(); } });
     lineEls.set(line.id, node);
-    // Insert in time order.
-    const idx = S.lines.indexOf(line);
-    const next = S.lines[idx + 1] && lineEls.get(S.lines[idx + 1].id);
     const nearBottom = el.list.scrollHeight - el.list.scrollTop - el.list.clientHeight < 80;
-    el.lines.insertBefore(node, next || null);
+    el.lines.append(node);
     if (nearBottom) el.list.scrollTop = el.list.scrollHeight;
   }
   node.classList.toggle('marked', !!line.marked);
-  // Same person still talking: don't repeat the name.
-  const prev = S.lines[S.lines.indexOf(line) - 1];
-  node.classList.toggle('cont', !!prev && prev.spk === line.spk && line.t - (prev.t + (prev.d || 0)) < 3);
   node.querySelector('.line-time').textContent = fmt(line.t);
-  const spk = node.querySelector('.spk');
-  spk.textContent = speakerName(line.spk);
-  spk.style.color = speakerColor(line.spk);
   node.querySelector('.badge').hidden = !line.marked;
   const p = node.querySelector('.line-text');
   if (document.activeElement !== p) p.textContent = line.text;
 }
 
-function renderAllLines() {
-  S.lines.forEach(renderLine);
-}
-
-// Inline menu to move one line to another speaker (fixes diarization slips).
-function pickSpeaker(line, anchor) {
-  const sel = document.createElement('select');
-  sel.className = 'spk';
-  const count = maxSpeaker();
-  for (let n = 1; n <= count; n++) sel.add(new Option(speakerName(n), n, false, n === line.spk));
-  sel.add(new Option('+ Novo falante', count + 1));
-  anchor.replaceWith(sel);
-  sel.focus();
-  let closed = false;
-  const done = () => {
-    if (closed) return;
-    closed = true;
-    const n = Number(sel.value);
-    sel.replaceWith(anchor);
-    if (n !== line.spk) {
-      line.spk = n;
-      line.manual = true;
-      clusterSpeakers();
-      renderAllLines();
-      renderSpeakers();
-      save();
-    }
-  };
-  sel.addEventListener('change', done);
-  sel.addEventListener('blur', done);
-}
-
-function renderSpeakers() {
-  const counts = new Map();
-  for (const l of S.lines) counts.set(l.spk, (counts.get(l.spk) || 0) + 1);
-  const ids = [...counts.keys()].sort((a, b) => a - b);
-  el.noSpeakers.hidden = ids.length > 0;
-  const focused = document.activeElement && document.activeElement.dataset.spk;
-  if (focused) return; // don't rebuild while the user is typing a name
-  el.speakers.innerHTML = '';
-  for (const n of ids) {
-    const li = document.createElement('li');
-    const sw = document.createElement('span');
-    sw.className = 'swatch';
-    sw.style.background = speakerColor(n);
-    const input = document.createElement('input');
-    input.value = speakerName(n);
-    input.dataset.spk = n;
-    input.setAttribute('aria-label', `Nome do Falante ${n}`);
-    input.addEventListener('change', () => {
-      const v = input.value.trim();
-      if (v && v !== `Falante ${n}`) S.names[n] = v; else delete S.names[n];
-      renderAllLines();
-      save();
-    });
-    input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') input.blur(); });
-    input.addEventListener('blur', () => setTimeout(renderSpeakers));
-    const merge = document.createElement('select');
-    merge.className = 'merge';
-    merge.title = 'Se for a mesma pessoa, junte as falas';
-    merge.setAttribute('aria-label', `Juntar ${speakerName(n)} com outro falante`);
-    merge.add(new Option('Juntar com…', ''));
-    for (const o of ids) if (o !== n) merge.add(new Option(speakerName(o), o));
-    merge.hidden = ids.length < 2;
-    merge.addEventListener('change', () => {
-      const into = Number(merge.value);
-      if (!into) return;
-      mergeSpeaker(n, into);
-      clusterSpeakers();
-      renumberSpeakers();
-      renderAllLines();
-      renderSpeakers();
-      render();
-      save();
-      flash('Falantes unidos');
-    });
-    const c = document.createElement('span');
-    c.className = 'muted';
-    c.textContent = `${counts.get(n)} ${counts.get(n) === 1 ? 'fala' : 'falas'}`;
-    li.append(sw, input, c, merge);
-    el.speakers.append(li);
-  }
+function renderPreview() {
+  el.preview.hidden = !draft.text;
+  if (!draft.text) return;
+  el.preview.querySelector('.line-time').textContent = fmt(draft.t ?? seconds());
+  el.preview.querySelector('.line-text').textContent = draft.text + '…';
+  const nearBottom = el.list.scrollHeight - el.list.scrollTop - el.list.clientHeight < 120;
+  if (nearBottom) el.list.scrollTop = el.list.scrollHeight;
 }
 
 function renderCounts() {
   const marks = S.lines.filter((l) => l.marked).length;
   el.counts.textContent = `${S.lines.length} ${S.lines.length === 1 ? 'fala' : 'falas'} · ${marks} ${marks === 1 ? 'marcada' : 'marcadas'}`;
+}
+
+function renderEngine() {
+  el.engineText.textContent = !Recognition
+    ? 'Este navegador não tem reconhecimento de voz. Abra este link no Google Chrome, no Microsoft Edge ou no Safari.'
+    : engineNote || `Pronto, nada para baixar. O áudio é enviado ${SERVICE.to} para virar texto e não é gravado.`;
 }
 
 function renderStatus() {
@@ -753,23 +332,18 @@ function renderStatus() {
   el.statusLabel.style.color = colors[S.status];
   el.recDot.hidden = S.status !== 'rec';
   el.clock.textContent = fmt(seconds());
-
-  const waiting = pending.size;
-  el.listening.hidden = !(S.status === 'rec' || waiting > 0);
-  el.listening.querySelector('.eq').classList.toggle('quiet', S.status !== 'rec');
-  if (!engineReady && S.status === 'rec') el.listeningText.textContent = 'Ouvindo… a transcrição começa assim que o modelo de voz terminar de baixar.';
-  else if (S.status === 'rec') el.listeningText.textContent = waiting > 1 ? `Ouvindo… (${waiting} trechos sendo transcritos)` : 'Ouvindo…';
-  else el.listeningText.textContent = `Finalizando a transcrição… (${waiting} ${waiting === 1 ? 'trecho' : 'trechos'})`;
+  el.listening.hidden = S.status !== 'rec';
   el.pausedNote.hidden = S.status !== 'paused';
 }
 
 function render() {
   const st = S.status;
   el.start.hidden = st !== 'idle';
-  el.start.disabled = false;
+  el.start.disabled = !Recognition;
   el.pause.hidden = st !== 'rec';
   el.mark.hidden = st !== 'rec';
   el.resume.hidden = st !== 'paused';
+  el.resume.disabled = !Recognition;
   el.stop.hidden = !(st === 'rec' || st === 'paused');
   el.newMeeting.hidden = st !== 'stopped';
   const none = S.lines.length === 0;
@@ -777,10 +351,10 @@ function render() {
   el.download.disabled = none;
   el.claude.disabled = none;
   el.empty.hidden = !none;
-  el.quality.disabled = st === 'rec' || st === 'paused';
-  el.meta.textContent = fmtDate(S.startedAt || Date.now()) + (S.lines.length ? ` · Participantes: ${[...new Set(S.lines.map((l) => l.spk))].sort((a, b) => a - b).map(speakerName).join(', ')}` : '');
+  el.meta.textContent = fmtDate(S.startedAt || Date.now());
   renderCounts();
   renderStatus();
+  renderEngine();
 }
 
 // ---------- persistence ----------
@@ -790,8 +364,8 @@ function save() {
   saveT = setTimeout(() => {
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify({
-        title: S.title, startedAt: S.startedAt, samples: S.samples, lines: S.lines, people: S.people, peopleChosen: S.peopleChosen,
-        names: S.names, nextId: S.nextId, lineSeq: S.lineSeq, status: S.status,
+        title: S.title, startedAt: S.startedAt, elapsed: Math.round(seconds() * 1000),
+        lines: S.lines, nextId: S.nextId, status: S.status,
       }));
     } catch (e) { console.warn('save failed', e); }
   }, 300);
@@ -801,106 +375,73 @@ function restore() {
   try {
     const d = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
     if (!d) return;
-    Object.assign(S, d);
-    // Older saves defaulted to auto-detect; only keep it if she picked it.
-    if (!d.peopleChosen) S.people = 2;
+    S.title = d.title || S.title;
+    S.startedAt = d.startedAt || null;
+    // The Whisper version counted 16 kHz audio samples instead of milliseconds,
+    // and kept speakers and voice prints on each line.
+    S.elapsed = d.elapsed ?? ((d.samples || 0) / 16000) * 1000;
+    S.lines = (d.lines || []).map(({ id, t, text, marked }) => ({ id, t, text, marked: !!marked }));
+    S.nextId = S.lines.reduce((n, l) => Math.max(n, l.id + 1), d.nextId || 1);
+    S.status = d.status || 'idle';
     // The microphone can't survive a page reload; continue as paused.
-    if (S.status === 'rec') S.status = 'paused';
-    if (S.status === 'idle' && S.lines.length) S.status = 'paused';
+    if (S.status === 'rec' || (S.status === 'idle' && S.lines.length)) S.status = 'paused';
     el.title.value = S.title;
-    el.people.value = String(S.people || 0);
-    renderAllLines();
-    renderSpeakers();
+    S.lines.forEach(renderLine);
   } catch (e) { console.warn('restore failed', e); }
 }
+
+// The Whisper version kept ~600 MB of speech models in this browser; free it.
+try { localStorage.removeItem('notas-consulta:quality'); } catch { /* ignore */ }
+if (window.caches) caches.delete('transformers-cache').catch(() => {});
 
 // ---------- wiring ----------
 el.start.onclick = start;
 el.resume.onclick = start;
-el.pause.onclick = pause;
-el.stop.onclick = stop;
+el.pause.onclick = () => endRecording('paused');
+el.stop.onclick = () => endRecording('stopped');
 el.mark.onclick = mark;
 el.newMeeting.onclick = newMeeting;
 el.copy.onclick = () => copyText(asText(), 'Transcrição copiada');
 el.download.onclick = download;
 el.claude.onclick = () => copyText(CLAUDE_PROMPT + '\n' + asText(), 'Copiado. Agora cole no Claude (Cmd/Ctrl + V).');
 el.title.addEventListener('input', () => { S.title = el.title.value; save(); });
-el.people.addEventListener('change', () => {
-  S.people = Number(el.people.value);
-  S.peopleChosen = true;
-  // Already more voices than people? Fold the closest ones together now.
-  if (S.lines.length) {
-    clusterSpeakers();
-    renderAllLines();
-    renderSpeakers();
-    render();
-  }
-  save();
-});
-
-try { el.quality.value = localStorage.getItem(QUALITY_KEY) || 'auto'; } catch { /* ignore */ }
-el.quality.addEventListener('change', () => {
-  try { localStorage.setItem(QUALITY_KEY, el.quality.value); } catch { /* ignore */ }
-  startWorker();
-});
 
 window.addEventListener('beforeunload', (e) => {
-  if (S.status === 'rec' || pending.size) { e.preventDefault(); e.returnValue = ''; }
+  if (S.status === 'rec') { e.preventDefault(); e.returnValue = ''; }
 });
 setInterval(() => { if (S.status === 'rec') renderStatus(); }, 500);
 
+// Test hooks: /?debug exposes the state; /?debug&fake swaps the browser's
+// recognizer for a scripted one (see test/speech-check.js).
+const params = new URLSearchParams(location.search);
+if (params.has('debug')) {
+  window.__S = S;
+  window.__asText = asText;
+  if (params.has('fake')) {
+    Recognition = class {
+      constructor() { this.results = []; window.__rec = this; }
+      start() { window.__starts = (window.__starts || 0) + 1; }
+      // Like Chrome: the phrase being spoken is finalized, then the session ends.
+      stop() {
+        setTimeout(() => {
+          const last = this.results.at(-1);
+          if (last && !last.isFinal) this.say(last[0].transcript, true);
+          this.onend();
+        });
+      }
+      say(transcript, isFinal) {
+        const r = Object.assign([{ transcript }], { isFinal });
+        const last = this.results.at(-1);
+        if (last && !last.isFinal) this.results[this.results.length - 1] = r;
+        else this.results.push(r);
+        this.onresult({ resultIndex: this.results.length - 1, results: this.results });
+      }
+      fail(error) { this.onerror({ error }); this.onend(); }
+      end() { this.onend(); }
+    };
+  }
+}
+
 restore();
 render();
-startWorker();
-
-// Test hook: /?debug then __feed('file.wav') runs a recording through the same pipeline.
-if (new URLSearchParams(location.search).has('debug')) {
-  window.__S = S;
-  window.__cluster = clusterSpeakers;
-  window.__timings = [];
-  window.__feed = async (url) => {
-    const buf = await (await fetch(url)).arrayBuffer();
-    const decoded = await new AudioContext().decodeAudioData(buf);
-    const off = new OfflineAudioContext(1, Math.ceil(decoded.duration * SR), SR);
-    const src = off.createBufferSource();
-    src.buffer = decoded;
-    src.connect(off.destination);
-    src.start();
-    const mono = (await off.startRendering()).getChannelData(0);
-    if (!S.startedAt) S.startedAt = Date.now();
-    S.status = 'rec';
-    render();
-    for (let i = 0; i + FRAME <= mono.length; i += FRAME) onFrame(mono.slice(i, i + FRAME));
-    stop();
-  };
-  // Same, but through audio-processor.js at a laptop mic's 48 kHz, like a live meeting.
-  window.__feedMic = async (url, rate = 48000, realtime = false) => {
-    const buf = await (await fetch(url)).arrayBuffer();
-    const off = new OfflineAudioContext(1, 1, rate);
-    const decoded = await off.decodeAudioData(buf);
-    const ctx = new OfflineAudioContext(1, decoded.length, rate);
-    await ctx.audioWorklet.addModule('audio-processor.js?v=' + Date.now());
-    const node = new AudioWorkletNode(ctx, 'downsampler');
-    const frames = [];
-    node.port.onmessage = (e) => frames.push(e.data);
-    const src = ctx.createBufferSource();
-    src.buffer = decoded;
-    src.connect(node).connect(ctx.destination);
-    src.start();
-    await ctx.startRendering();
-    await new Promise((r) => setTimeout(r, 500)); // let the last frames arrive
-    if (!S.startedAt) S.startedAt = Date.now();
-    S.status = 'rec';
-    render();
-    const t0 = performance.now();
-    for (let i = 0; i < frames.length; i++) {
-      // Realtime: hand frames over at speaking speed, like a live microphone.
-      if (realtime && i % 16 === 0) {
-        const due = t0 + (i * FRAME * 1000) / SR;
-        if (due > performance.now()) await new Promise((r) => setTimeout(r, due - performance.now()));
-      }
-      onFrame(frames[i]);
-    }
-    stop();
-  };
-}
+renderPreview();

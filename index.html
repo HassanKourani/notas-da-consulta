@@ -7,7 +7,7 @@
 <link rel="icon" href="assets/logo.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Marcellus&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css?v=14">
+<link rel="stylesheet" href="styles.css?v=15">
 </head>
 <body>
 <div class="page">
@@ -32,16 +32,6 @@
       <label for="mtitle" class="eyebrow">Reunião</label>
       <input id="mtitle" class="title-input" value="Consulta com cliente" autocomplete="off">
       <span class="muted small" id="meta"></span>
-      <label class="muted small people">Pessoas na reunião
-        <select id="people">
-          <option value="0">Não sei (detectar)</option>
-          <option value="2" selected>2</option>
-          <option value="3">3</option>
-          <option value="4">4</option>
-          <option value="5">5</option>
-          <option value="6">6</option>
-        </select>
-      </label>
     </div>
     <div class="buttons">
       <button id="btnStart" class="btn btn-primary btn-lg" disabled>
@@ -108,31 +98,15 @@
       </section>
 
       <section class="card side-card">
-        <h2>Falantes</h2>
-        <p id="noSpeakers" class="muted small-14">As vozes aparecem aqui como Falante 1, 2, 3. Clique no nome para trocar.</p>
-        <ul id="speakers" class="speakers"></ul>
-        <p class="muted small-14">Dica: informe em “Pessoas na reunião” quantas pessoas vão falar. Vozes parecidas só se separam bem assim. Se a mesma pessoa aparecer duas vezes, use “Juntar com…”.</p>
-      </section>
-
-      <section class="card side-card">
         <h2>Reconhecimento de voz</h2>
         <p id="engineText" class="muted small-14">Preparando…</p>
-        <div id="progressWrap" class="progress" hidden><div id="progressBar"></div></div>
-        <label class="small-14 quality">
-          Qualidade
-          <select id="quality">
-            <option value="auto">Automática</option>
-            <option value="alta">Alta (mais precisa, download maior)</option>
-            <option value="leve">Leve (download menor, sem placa de vídeo)</option>
-          </select>
-        </label>
       </section>
 
-      <p class="muted small footnote">O áudio é processado só neste computador e não é gravado. Nomes e anotações são um rascunho. Revise antes de compartilhar com o cliente.</p>
+      <p class="muted small footnote">O áudio não é gravado. Para virar texto, ele passa pelo serviço de voz do navegador (Google no Chrome, Microsoft no Edge, Apple no Safari). Só o texto fica salvo, neste computador. A transcrição é um rascunho: revise antes de compartilhar com o cliente.</p>
     </aside>
   </div>
 </div>
 <div id="toast" class="toast" role="status" hidden></div>
-<script type="module" src="app.js?v=14"></script>
+<script type="module" src="app.js?v=15"></script>
 </body>
 </html>
