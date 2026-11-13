@@ -31,7 +31,7 @@ The lawyer should open the link and start transcribing at once. The current vers
 ## Design
 
 **Engine**
-- `SpeechRecognition` / `webkitSpeechRecognition` with `lang = 'pt-BR'`, `continuous`, and `interimResults`.
+- `SpeechRecognition` / `webkitSpeechRecognition` with `lang = 'pt-BR'` and `interimResults`, one phrase per session (`continuous = false`), restarted after each one. Chosen after testing in Chrome: continuous sessions closed a line only every 30–40 s and once stalled.
 - Draft words show in the grey "Ouvindo…" row. Each phrase the browser finalizes becomes one line.
 - Browsers end recognition sessions on their own, after silence or after a few minutes. While recording, the app restarts it at once.
 - Errors:

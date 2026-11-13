@@ -66,6 +66,12 @@ window.__speechCheck = async () => {
   out.check('the line keeps the time its first words appeared', first && first.t >= 1 && first.t < 1.6, first && first.t);
   out.check('preview clears after the final phrase', $('preview').hidden);
 
+  // Chrome splits a phrase into several interim pieces; resultIndex can point at the last one.
+  const piece = (transcript) => Object.assign([{ transcript }], { isFinal: false });
+  window.__rec.onresult({ resultIndex: 1, results: [piece('você trouxe'), piece(' uma cópia')] });
+  await wait(20);
+  out.check('the draft shows every interim piece', $('preview').textContent.includes('Você trouxe uma cópia'), $('preview').textContent);
+
   window.__rec.say('eu queria falar sobre', false);
   await wait(20);
   window.__rec.end();

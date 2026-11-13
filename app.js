@@ -88,12 +88,15 @@ let engineNote = ''; // why recognition stopped, shown in the speech card
 let markNext = false; // Marcar pressed while a phrase was still being spoken
 const draft = { t: null, text: '' }; // words heard but not final yet
 
-// Browsers end a recognition session on their own (after a silence, a network
-// hiccup or a few minutes), so while recording a new one starts right away.
+// One phrase per session: the browser ends it at the speaker's pause and a new
+// one starts right away. In Chrome, one long "continuous" session only closed a
+// line every 30-40 s (several people's turns in one line) and once stopped
+// returning text after 37 s; one phrase per session gave a line per turn with
+// about the same words (README "Tested").
 function listen() {
   const r = new Recognition();
   r.lang = 'pt-BR';
-  r.continuous = true;
+  r.continuous = false;
   r.interimResults = true;
   r.onresult = onSpeech;
   r.onerror = (e) => { speechError = e.error; };
@@ -104,17 +107,17 @@ function listen() {
 
 function onSpeech(e) {
   failures = 0;
-  let interim = '';
   for (let i = e.resultIndex; i < e.results.length; i++) {
     const r = e.results[i];
-    if (r.isFinal) {
-      // The line's time is when its first words appeared, not when it ended.
-      addLine(draft.t ?? seconds(), r[0].transcript);
-      draft.t = null;
-    } else {
-      interim += r[0].transcript;
-    }
+    if (!r.isFinal) continue;
+    // The line's time is when its first words appeared, not when it ended.
+    addLine(draft.t ?? seconds(), r[0].transcript);
+    draft.t = null;
   }
+  // Chrome splits the phrase still being spoken into several interim results,
+  // and resultIndex can point past the first of them.
+  let interim = '';
+  for (const r of e.results) if (!r.isFinal) interim += r[0].transcript;
   draft.text = cleanText(interim);
   if (!draft.text) draft.t = null;
   else if (draft.t === null) draft.t = seconds();
